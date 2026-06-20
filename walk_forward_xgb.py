@@ -168,18 +168,23 @@ class WalkForwardXGB:
     _model_dates: List[Tuple] = field(default_factory=list)  # (train_start, train_end, test_start, test_end)
     _last_train_date: Optional[pd.Timestamp] = field(default=None)
 
-    def build_features(self, school_signals: Dict[str, Dict]) -> np.ndarray:
+    def build_features(
+        self,
+        school_signals: Dict[str, Dict],
+        ohlcv_array: np.ndarray = None,
+    ) -> np.ndarray:
         """
-        从学派信号构建特征向量。
+        Build feature vector from school signals + optional temporal embedding.
 
-        每个学派 → [direction_score, confidence] 两个特征
-        direction_score: bullish=+score, bearish=-score, neutral=0
+        School features: [direction_score, confidence] per school
+        Temporal: 8-dim frozen LSTM embedding of recent OHLCV path
 
-        Returns:
-            (1, 2N) 特征数组
+        When self.feature_names is known (after training), output columns are
+        strictly aligned to it. Missing temporal features → zero-filled.
         """
-        features = []
-        names = []
+        feature_dict = {}
+
+        # ---- School-based features ----
         for name in sorted(school_signals.keys()):
             sig = school_signals[name]
             direction = sig.get('direction', 'neutral')
@@ -193,193 +198,127 @@ class WalkForwardXGB:
             else:
                 dir_score = 0.0
 
-            features.extend([dir_score, float(conf)])
-            names.extend([f'{name}_dir', f'{name}_conf'])
+            feature_dict[f'{name}_dir'] = dir_score
+            feature_dict[f'{name}_conf'] = float(conf)
 
-        self.feature_names = names
-        return np.array(features).reshape(1, -1)
+        # ---- Temporal embedding (frozen random-projection LSTM) ----
+        if ohlcv_array is not None and ohlcv_array.size > 0:
+            try:
+                from ml_feature_pipeline import get_temporal_embedder
+                embedder = get_temporal_embedder()
+                temporal = embedder.embed_to_dict(ohlcv_array)
+                feature_dict.update(temporal)
+            except Exception:
+                pass
 
-    def compute_targets(
-        self,
-        prices: pd.Series,
-        horizon: int = None,
-    ) -> pd.Series:
-        """
-        计算未来 N 天的收益率方向作为训练目标。
+        # ---- Align to self.feature_names if available, else build from dict ----
+        if self.feature_names:
+            # Strict alignment: guarantee same column order as training
+            vec = np.array([feature_dict.get(n, 0.0) for n in self.feature_names],
+                           dtype=np.float64)
+        else:
+            # First call (before training): produce names from dict order
+            names = sorted(feature_dict.keys())
+            # School features first, then temporal
+            school_names = [n for n in names if not n.startswith('temporal_emb')]
+            temporal_names = [n for n in names if n.startswith('temporal_emb')]
+            ordered = school_names + temporal_names
+            self.feature_names = ordered
+            vec = np.array([feature_dict[n] for n in ordered], dtype=np.float64)
 
-        Target = sign(Price[t+horizon] / Price[t] - 1)
-        即: 未来 horizon 天后的价格相对今天的涨跌方向。
-
-        注意: 这里用的是 t+horizon 对 t 的收益率, 不是 t 对 t-horizon
-        不存在前向偏差, 因为 Target 标签的计算严格使用未来数据。
-        """
-        h = horizon or self.forecast_horizon
-        # 未来收益率: (Price[t+h] - Price[t]) / Price[t]
-        future_ret = prices.shift(-h) / prices - 1
-        # 方向标签: 1=正收益, 0=负收益
-        target = (future_ret > 0).astype(int)
-        # 最后 h 天的 Target 是 NaN (没有未来数据)
-        return target
+        return vec.reshape(1, -1)
 
     def fit_walk_forward(
         self,
         df: pd.DataFrame,
-        school_signals_col: str = 'school_votes_json',
-        price_col: str = 'exit_price',
+        feature_cols: List[str] = None,
+        target_col: str = 'target_y',
     ) -> "WalkForwardXGB":
         """
-        执行严格 Walk-Forward 滚动训练。
+        Walk-Forward 滚动训练 (Purge + Embargo)。
+
+        REQUIRES df already contains pre-computed features AND binary target.
+        Does NOT compute targets internally — use ml_feature_pipeline.py output.
 
         Args:
-            df: 包含学派信号和价格的 DataFrame, 按日期索引排序
-            school_signals_col: 学派投票 JSON 的列名
-            price_col: 价格列名 (用于计算远期收益目标)
+            df: Panel DataFrame indexed by date, sorted, with feature columns
+                AND a binary target column 'target_y' (1=positive excess return).
+                Must be SINGLE-stock or pre-aligned panel from ml_feature_pipeline.
+            feature_cols: list of feature column names. If None, auto-detected
+                          as all numeric columns except target_y.
+            target_col: name of the pre-computed binary target column.
 
         Returns:
-            self (训练好的模型链)
-
-        Usage:
-            wf = WalkForwardXGB()
-            wf.fit_walk_forward(trades_df)
-            prediction = wf.predict(current_school_signals)
+            self (trained model chain)
         """
-        import json
+        from sklearn.preprocessing import RobustScaler
 
-        # 1. 构建特征矩阵和目标向量
-        X_all = []
-        y_all = []
-        dates_all = []
-        symbols_all = []
+        # ---- Auto-detect feature columns ----
+        if feature_cols is None:
+            exclude = {target_col, 'target_y', 'symbol', 'date'}
+            feature_cols = [c for c in df.columns
+                            if c not in exclude and np.issubdtype(df[c].dtype, np.number)]
+        self.feature_names = feature_cols
 
-        for idx, row in df.iterrows():
-            try:
-                votes = row.get(school_signals_col, '{}')
-                if isinstance(votes, str):
-                    votes = json.loads(votes)
-                if not votes:
-                    continue
+        if target_col not in df.columns:
+            raise ValueError(f"df must contain '{target_col}' column (pre-computed target)")
 
-                features = self.build_features(votes).flatten()
-                X_all.append(features)
-                dates_all.append(idx)
-                symbols_all.append(row.get('symbol', '?'))
-            except Exception:
-                continue
-
-        if len(X_all) == 0:
-            print("[WalkForwardXGB] 无有效训练数据")
+        # Drop rows with NaN target (last N bars per stock)
+        df_valid = df.dropna(subset=[target_col])
+        if len(df_valid) < self.min_train_size:
+            print(f"[WalkForwardXGB] Insufficient valid rows: {len(df_valid)} < {self.min_train_size}")
             return self
 
-        X = np.array(X_all)
-        dates = pd.DatetimeIndex(dates_all)
-        prices = df[price_col]
+        X = df_valid[feature_cols].values.astype(np.float64)
+        y = df_valid[target_col].values.astype(int)
+        dates = pd.DatetimeIndex(df_valid.index)
 
-        # 2. 计算目标: 未来 N 天收益率方向
-        # 用 exit_price 作为参考价 (交易平仓价)
-        returns = prices.pct_change(self.forecast_horizon).shift(-self.forecast_horizon)
-        y_all = []
-        for d in dates:
-            if d in returns.index:
-                ret = returns.loc[d]
-                y_all.append(1 if (ret is not None and not pd.isna(ret) and ret > 0) else 0)
-            else:
-                y_all.append(0)
-
-        y = np.array(y_all)
-
-        # 构建带日期索引的临时 DataFrame 用于 Walk-Forward 切分
-        temp_df = pd.DataFrame({'X_idx': range(len(X)), 'y': y}, index=dates)
-        temp_df = temp_df.sort_index()
-
-        # 3. 执行 Walk-Forward 训练
+        # ---- Walk-Forward loop with Purge & Embargo ----
         n_splits = 0
         for train_idx, test_idx in generate_purged_splits(
-            temp_df,
+            df_valid,
             window_size=self.window_size,
             step_size=self.step_size,
             gap_days=self.gap_days,
             min_train_size=self.min_train_size,
         ):
-            # 获取对应的行号
-            train_rows = temp_df.loc[train_idx, 'X_idx'].values.astype(int)
-            test_rows = temp_df.loc[test_idx, 'X_idx'].values.astype(int)
+            train_mask = df_valid.index.isin(train_idx)
+            test_mask  = df_valid.index.isin(test_idx)
+            X_train, y_train = X[train_mask], y[train_mask]
+            X_test,  y_test  = X[test_mask],  y[test_mask]
 
-            if len(train_rows) < self.min_train_size or len(test_rows) < 10:
+            if len(X_train) < self.min_train_size or len(X_test) < 10:
                 continue
 
-            X_train = X[train_rows]
-            y_train = y[train_rows]
-            X_test = X[test_rows]
-            y_test = y[test_rows]
-
-            # 类别平衡检查: 至少 20% 的正负样本
             pos_ratio = y_train.mean()
             if pos_ratio < 0.20 or pos_ratio > 0.80:
-                # 样本极度不平衡 — 跳过此窗口
                 continue
 
-            # 训练 XGBoost
+            # ---- RobustScaler: fit on TRAIN only, transform both ----
+            scaler = RobustScaler(quantile_range=(5, 95))
+            X_train_s = scaler.fit_transform(X_train)
+            X_test_s  = scaler.transform(X_test)
+
+            # ---- Train XGBoost ----
             try:
                 import xgboost as xgb
                 model = xgb.XGBClassifier(**self.xgb_params)
-                model.fit(
-                    X_train, y_train,
-                    eval_set=[(X_test, y_test)],
-                    verbose=False,
-                )
+                model.fit(X_train_s, y_train,
+                          eval_set=[(X_test_s, y_test)], verbose=False)
             except ImportError:
                 from sklearn.linear_model import LogisticRegression
                 model = LogisticRegression(C=0.5, max_iter=1000)
-                model.fit(X_train, y_train)
+                model.fit(X_train_s, y_train)
 
-            # ============================================================
-            # 防护 1: 特征标准化隔离 (防均值/方差泄露)
-            # 红线: 绝对禁止对全局数据 fit_transform()
-            # 必须在每个窗口内: X_train.fit() → X_train.transform() & X_test.transform()
-            # ============================================================
-            from sklearn.preprocessing import RobustScaler  # 用 RobustScaler 抗异常值
-            scaler = RobustScaler(quantile_range=(5, 95))   # 5%截尾, 抗极端K线
-            X_train_scaled = scaler.fit_transform(X_train)   # ← 仅在 X_train 上 fit
-            X_test_scaled = scaler.transform(X_test)         # ← X_test 仅 transform
-            # 此时 X_train 的均值/方差信息完全未泄露到 X_test
-
-            # ============================================================
-            # 防护 2: 超额收益二分类标签
-            # Target = 1 if (个股未来N天收益 - 基准未来N天收益) > 2%, else 0
-            # 使用 binary:logistic, 输出概率, 不做回归
-            # ============================================================
-            # y_train 已在上层转换为二分类, 此处确保 objective 为 binary:logistic
-            self.xgb_params['objective'] = 'binary:logistic'
-
-            # 训练 XGBoost (带因子坍塌检测)
-            try:
-                import xgboost as xgb
-                model = xgb.XGBClassifier(**self.xgb_params)
-                model.fit(
-                    X_train_scaled, y_train,
-                    eval_set=[(X_test_scaled, y_test)],
-                    verbose=False,
-                )
-            except ImportError:
-                from sklearn.linear_model import LogisticRegression
-                model = LogisticRegression(C=0.5, max_iter=1000)
-                model.fit(X_train_scaled, y_train)
-
-            # ============================================================
-            # 防护 3: 因子坍塌检测 (Factor Collapse Detection)
-            # 如果单一学派特征重要性 > 80% → 强制降 colsample + 特征惩罚
-            # ============================================================
+            # ---- Factor collapse check ----
             collapse_warning = self._check_feature_dominance(
                 model, self.feature_names, n_splits)
             if collapse_warning:
-                # 自动应用因子坍塌应急预案:
-                #   降低 colsample_bytree → 强制每棵树只看部分特征
-                #   增加 reg_alpha → L1 惩罚 → 自动特征选择
                 self.xgb_params['colsample_bytree'] = max(
                     0.30, self.xgb_params.get('colsample_bytree', 0.60) - 0.10)
                 self.xgb_params['reg_alpha'] = min(
                     2.0, self.xgb_params.get('reg_alpha', 0.5) + 0.30)
-                print(f"  [FactorCollapse] 窗口{n_splits+1}: {collapse_warning}")
+                print(f"  [FactorCollapse] W{n_splits+1}: {collapse_warning}")
                 print(f"    应急: colsample={self.xgb_params['colsample_bytree']:.2f} "
                       f"reg_alpha={self.xgb_params['reg_alpha']:.2f}")
 

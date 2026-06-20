@@ -160,23 +160,50 @@ def _precompute_stock_worker(args):
     return results
 
 
-def _precompute_from_memory(args):
+def _precompute_chunk_worker(args):
     """
-    Phase 2 worker: compute signals from PRE-LOADED DataFrames.
-    ZERO disk I/O — all data passed via memory. Safe for joblib.Parallel.
+    ProcessPoolExecutor worker: loads TDX data internally, computes signals.
+
+    Accepts (symbols, tdx_dir, trading_day_strs).
+    Each worker creates its own Reader instance — ZERO DataFrame pickling.
+    Returns only lightweight signal dicts (no raw OHLCV DataFrames).
     """
     import pandas as pd
     from datetime import date
+    from mootdx.reader import Reader
+    from indicators_v2 import compute_all_indicators_v2
+    from expert_ensemble import compute_expert_ensemble
 
-    chunk_data, trading_day_strs = args
+    symbols, tdx_dir, trading_day_strs = args
     trading_days = [date.fromisoformat(d) for d in trading_day_strs]
+
+    reader = Reader.factory(market='std', tdxdir=tdx_dir)
     results = {}
 
-    for symbol, df in chunk_data.items():
+    for symbol in symbols:
+        # ---- Load data inside worker (zero IPC overhead) ----
+        try:
+            df = reader.daily(symbol=symbol)
+        except Exception:
+            continue
+        if df is None or df.empty:
+            continue
         if not isinstance(df.index, pd.DatetimeIndex):
             df.index = pd.to_datetime(df.index)
         df.sort_index(inplace=True)
 
+        # ---- Dead-fish pre-filter ----
+        if len(df) >= 60:
+            recent = df.tail(20)
+            avg_amt = float(recent['volume'].mean()) * 100 * float(recent['close'].mean())
+            if avg_amt < 50_000_000:
+                continue
+            close_px = float(df['close'].iloc[-1])
+            ma60_px = float(df['close'].tail(60).mean())
+            if ma60_px > 0 and close_px < ma60_px * 0.75:
+                continue
+
+        # ---- Compute signals for each trading day ----
         for date_obj in trading_days:
             cache_key = f"{symbol}_{date_obj.isoformat()}"
             ts = pd.Timestamp(date_obj)
@@ -196,7 +223,6 @@ def _precompute_from_memory(args):
             }
 
             try:
-                from indicators_v2 import compute_all_indicators_v2
                 indicators = compute_all_indicators_v2(df_sliced, None, None, symbol=symbol)
             except Exception:
                 results[cache_key] = None; continue
@@ -204,7 +230,6 @@ def _precompute_from_memory(args):
                 results[cache_key] = None; continue
 
             try:
-                from expert_ensemble import compute_expert_ensemble
                 ensemble = compute_expert_ensemble(indicators)
             except Exception:
                 results[cache_key] = None; continue
@@ -213,6 +238,7 @@ def _precompute_from_memory(args):
                 'symbol': symbol, 'date': date_obj,
                 **ohlcv, 'indicators': indicators, 'ensemble': ensemble,
             }
+
     return results
 
 
@@ -555,15 +581,17 @@ class BacktestEngine:
         workers: int = 0,
     ) -> int:
         """
-        Two-phase architecture: I/O entirely separated from CPU compute.
+        Single-phase parallel precompute — zero main-process data loading.
 
-        Phase 1: Single-process pre-fetch (NO I/O deadlock).
-          Loads all stock data, applies dead-fish filter (volume + MA60).
-          5074 stocks → ~1-2 minutes, single-threaded TDX reads.
+        Architecture:
+          Main process:  filter symbols → chunk → dispatch to workers
+          Each worker:   creates its own Reader, loads TDX data internally,
+                         applies dead-fish filter, computes indicators+ensemble,
+                         returns ONLY lightweight signal dicts.
 
-        Phase 2: joblib.Parallel CPU-only compute (NO disk I/O).
-          Workers receive pre-loaded DataFrames via memory.
-          Fully utilizes all cores with loky backend.
+        Eliminates the old Phase 1 (pre-fetch 5000 DataFrames into memory)
+        and Phase 2 (pickle massive DataFrames to subprocesses) — both
+        were causing IPC serialization bottlenecks and OOM risk.
         """
         import os, time
         if workers <= 0:
@@ -573,68 +601,38 @@ class BacktestEngine:
         if workers <= 1 or len(self.stock_pool) < 20:
             return 0
 
+        from config import FUYI_TDX_DIR
         symbols = list(self.stock_pool)
         trading_day_strs = [d.isoformat() for d in trading_days]
 
-        # ================================================================
-        # Phase 1: Single-process pre-fetch + dead-fish filter
-        # ================================================================
-        print(f"[Precompute] Phase 1: Pre-fetching {len(symbols)} stocks (single-process)...")
-        t0 = time.time()
-
-        preloaded = {}
-        skipped = 0
-        for sym in symbols:
-            df = self.all_daily_data.get(sym)
-            if df is None or df.empty:
-                skipped += 1; continue
-            # Dead-fish filter: liquidity + trend
-            if len(df) >= 60:
-                recent = df.tail(20)
-                avg_amt = float(recent['volume'].mean()) * 100 * float(recent['close'].mean())
-                if avg_amt < 50_000_000:  # < 5000万
-                    skipped += 1; continue
-                close_px = float(df['close'].iloc[-1])
-                ma60_px = float(df['close'].tail(60).mean())
-                if ma60_px > 0 and close_px < ma60_px * 0.75:  # deep bear
-                    skipped += 1; continue
-            preloaded[sym] = df
-
-        print(f"[Precompute] Phase 1 done: {len(preloaded)} passed, {skipped} skipped "
-              f"({time.time()-t0:.0f}s)")
-
-        if not preloaded:
-            return 0
-
-        # ================================================================
-        # Phase 2: ProcessPoolExecutor — chunked parallel, zero I/O in workers
-        # ================================================================
-        syms = list(preloaded.keys())
-        n_chunks = workers
-        chunk_size = max(1, len(syms) // n_chunks)
+        # ---- Chunk symbols (no data pre-loading) ----
+        chunk_size = max(1, len(symbols) // workers)
         chunks = []
-        for i in range(0, len(syms), chunk_size):
-            chunk_syms = syms[i:i+chunk_size]
-            chunks.append(({s: preloaded[s] for s in chunk_syms}, trading_day_strs))
+        for i in range(0, len(symbols), chunk_size):
+            chunk_syms = symbols[i:i + chunk_size]
+            chunks.append((chunk_syms, FUYI_TDX_DIR, trading_day_strs))
 
-        print(f"[Precompute] Phase 2: {workers} workers x {len(chunks)} chunks ({len(syms)} stocks)")
+        print(f"[Precompute] {workers} workers x {len(chunks)} chunks "
+              f"({len(symbols)} stocks, zero pre-fetch)")
+
         t0 = time.time()
-
-        from concurrent.futures import ProcessPoolExecutor, as_completed
         with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_precompute_from_memory, c): i for i, c in enumerate(chunks)}
+            futures = {pool.submit(_precompute_chunk_worker, c): i
+                       for i, c in enumerate(chunks)}
             for fut in as_completed(futures):
                 chunk_idx = futures[fut]
                 try:
                     r = fut.result()
                     self.signal_cache.update(r)
-                    print(f"  [Precompute] Chunk {chunk_idx+1}/{len(chunks)} done")
+                    done_count = sum(1 for v in r.values() if v is not None)
+                    print(f"  [Precompute] Chunk {chunk_idx+1}/{len(chunks)} "
+                          f"→ {done_count} signals")
                 except Exception as e:
                     print(f"  [Precompute] Chunk {chunk_idx+1} FAILED: {e}")
 
         elapsed = time.time() - t0
         n_cached = sum(1 for v in self.signal_cache.values() if v is not None)
-        print(f"[Precompute] Phase 2 done: {n_cached} signals in {elapsed/60:.1f}min")
+        print(f"[Precompute] done: {n_cached} signals in {elapsed/60:.1f}min")
         return n_cached
 
     def compute_daily_signals(
@@ -822,6 +820,7 @@ class BacktestEngine:
                         limit_ratio = get_limit_ratio(sym)
                         dyn_slip = compute_dynamic_slippage(
                             self._stock_quality.get(sym, {}).get('atr_pct', 0.03))
+                        entry_date_str = str(df.index[df.index == entry_idx][0].date())
                         vec_result = match_exits_vectorized(
                             future_bars, pos['entry_price'], pos['stop_loss'],
                             np.array(sorted(all_targets)),
@@ -829,6 +828,8 @@ class BacktestEngine:
                             trailing_atr_mult=TRAILING_STOP_ATR_MULT,
                             limit_ratio=limit_ratio,
                             slippage_entry=dyn_slip,
+                            symbol=sym,
+                            entry_date=entry_date_str,
                         )
                         # Map to legacy replay format
                         replay = {
@@ -1315,7 +1316,16 @@ class BacktestEngine:
         vwap_info = None
         try:
             from execution_algos import execute_with_vwap
-            est_value = self.cash * self.position_pct
+            # Use total equity (not just cash) for VWAP eligibility check
+            positions_value_pre = 0.0
+            for sym_p, pos_p in self.positions.items():
+                df_p = self.all_daily_data.get(sym_p)
+                if df_p is not None and not df_p.empty:
+                    positions_value_pre += pos_p['shares'] * float(df_p['close'].iloc[-1])
+                else:
+                    positions_value_pre += pos_p['shares'] * pos_p['entry_price']
+            pre_equity = self.cash + positions_value_pre
+            est_value = pre_equity * self.position_pct
             if est_value >= 1_000_000:
                 q_vwap = self._stock_quality.get(symbol, {})
                 adv_shares_vwap = int(q_vwap.get('avg_vol', 1000000))
@@ -1346,11 +1356,28 @@ class BacktestEngine:
             adjusted_pct *= 0.50
             adjusted_pct = max(MIN_POSITION_PCT, adjusted_pct)
 
-        # Step 1: estimate shares at raw open price (before slippage)
+        # Step 0: compute total equity (cash + mark-to-market positions)
+        positions_value = 0.0
+        for sym_p, pos_p in self.positions.items():
+            df_p = self.all_daily_data.get(sym_p)
+            if df_p is not None and not df_p.empty:
+                last_close_p = float(df_p['close'].iloc[-1])
+                positions_value += pos_p['shares'] * last_close_p
+            else:
+                positions_value += pos_p['shares'] * pos_p['entry_price']
+        total_equity = self.cash + positions_value
+
+        # Step 1: compute target purchase amount from total equity
+        target_amount = total_equity * adjusted_pct
+
+        # Cash constraint: cannot spend more than available cash
+        if target_amount > self.cash:
+            target_amount = self.cash
+
         raw_price = entry_price
-        if raw_price <= 0 or np.isnan(raw_price):
+        if raw_price <= 0 or np.isnan(raw_price) or target_amount < raw_price * A_SHARE_LOT_SIZE:
             return
-        estimated_shares = int((self.cash * adjusted_pct) / raw_price / A_SHARE_LOT_SIZE) * A_SHARE_LOT_SIZE
+        estimated_shares = int(target_amount / raw_price / A_SHARE_LOT_SIZE) * A_SHARE_LOT_SIZE
         if estimated_shares < A_SHARE_LOT_SIZE:
             return
 
@@ -1367,8 +1394,8 @@ class BacktestEngine:
         except ImportError:
             entry_price = raw_price * (1.0 + SLIPPAGE)
 
-        # Step 3: compute actual shares at real entry price
-        shares = int((self.cash * adjusted_pct) / entry_price / A_SHARE_LOT_SIZE) * A_SHARE_LOT_SIZE
+        # Step 3: compute actual shares at real entry price (with cash cap)
+        shares = int(target_amount / entry_price / A_SHARE_LOT_SIZE) * A_SHARE_LOT_SIZE
         if shares < A_SHARE_LOT_SIZE:
             return
 

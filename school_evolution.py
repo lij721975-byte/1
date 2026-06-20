@@ -185,6 +185,7 @@ class SchoolWeightLearner:
         return {
             'n_signals': 0, 'n_correct': 0, 'n_incorrect': 0,
             'total_pnl_bps': 0.0, 'total_pnl_sq_bps': 0.0,
+            'total_win_bps': 0.0, 'total_loss_bps': 0.0,
             'total_confidence': 0.0, 'win_rate': 0.0,
             'avg_pnl_bps': 0.0, 'sharpe_like': 0.0, 'quality_score': 0.0,
             'decay_gated': 0.0,  # 1.0 if weight decay is active (binom significant)
@@ -374,6 +375,10 @@ class SchoolWeightLearner:
 
                 m['total_pnl_bps'] += attr_bps; g['total_pnl_bps'] += attr_bps
                 m['total_pnl_sq_bps'] += attr_bps ** 2; g['total_pnl_sq_bps'] += attr_bps ** 2
+                if attr_bps > 0:
+                    m['total_win_bps'] += attr_bps; g['total_win_bps'] += attr_bps
+                else:
+                    m['total_loss_bps'] += attr_bps; g['total_loss_bps'] += attr_bps
 
             self._total_trades_attributed += 1
 
@@ -432,19 +437,29 @@ class SchoolWeightLearner:
     def _recompute_derived(m: Dict[str, float]) -> None:
         n = max(int(m['n_signals']), 1)
         n_correct = int(m['n_correct'])
+        n_incorrect = int(m.get('n_incorrect', n - n_correct))
         m['win_rate'] = round(n_correct / n, 4)
         m['avg_pnl_bps'] = round(m['total_pnl_bps'] / n, 2)
-        # Sharpe-like: mean(pnl) / std(pnl), annualized
+
+        # ---- Expected Value quality score (replaces pseudo-Sharpe) ----
+        # EV = Win_Rate * Avg_Win - Loss_Rate * |Avg_Loss|
+        # This is mathematically valid for variable-holding-period trades.
+        avg_win  = m['total_win_bps'] / max(n_correct, 1)
+        avg_loss = m['total_loss_bps'] / max(n_incorrect, 1)
+        loss_rate = 1.0 - m['win_rate']
+        ev_per_trade = m['win_rate'] * avg_win - loss_rate * abs(avg_loss)
+
+        # sqrt(n) credibility: more trades = more confidence, with diminishing returns
+        credibility = min(1.0, np.sqrt(n / 30.0))
+
+        # Normalize EV to ~[0, 1]: 50 bps EV → 0.5, 100 bps → 1.0
+        ev_normalized = min(1.0, max(0.0, ev_per_trade / 100.0))
+        m['quality_score'] = round(ev_normalized * credibility, 4)
+
+        # Retain sharpe_like for backward compatibility (deprecated, not used in quality)
         mean_bps = m['total_pnl_bps'] / n
         var_bps = m['total_pnl_sq_bps'] / n - mean_bps ** 2
-        if var_bps > 0:
-            m['sharpe_like'] = round(mean_bps / (var_bps ** 0.5 + 1e-10), 3)
-        else:
-            m['sharpe_like'] = 0.0
-        # Quality score: win_rate * (sharpe_like normalized) with sqrt(n) credibility
-        quality = m['win_rate'] * (1.0 + max(-0.5, min(1.0, m['sharpe_like'] * 0.5)))
-        credibility = min(1.0, np.sqrt(n / 30.0))
-        m['quality_score'] = round(quality * credibility, 4)
+        m['sharpe_like'] = round(mean_bps / (max(var_bps, 1e-10) ** 0.5), 3) if var_bps > 0 else 0.0
 
     # ========================================================================
     # Weight computation

@@ -33,56 +33,95 @@ LIMIT_RATIOS = {
     'bse':   0.30,  # 北交所 ±30%
 }
 
-def get_limit_ratio(symbol: str) -> float:
-    """Determine daily limit ratio from stock code prefix."""
+def get_limit_ratio(symbol: str, is_st: bool = False) -> float:
+    """Determine daily limit ratio from stock code prefix.
+
+    A-shares:
+      - Main board (00/60): ±10%  (ST: ±5%)
+      - ChiNext (30):       ±20%
+      - STAR (688):         ±20%
+      - BSE (4/8):          ±30%
+    """
+    if is_st:
+        return 0.05
     code = str(symbol)
-    if code.startswith('30'):   # 创业板
+    if code.startswith('30'):             # 创业板
         return 0.20
-    elif code.startswith('688'): # 科创板
+    elif code.startswith('688'):           # 科创板
         return 0.20
     elif code.startswith('4') or code.startswith('8'):  # 北交所
         return 0.30
     elif code.startswith('00') or code.startswith('60'):  # 主板
         return 0.10
-    return 0.10  # 默认主板
+    return 0.10
+
+
+def _round_limit_price(raw_price: float, ratio: float, direction: int) -> float:
+    """Compute exact daily limit price rounded to 2 decimal places (A-share tick).
+
+    direction: +1 = limit-up, -1 = limit-down
+    """
+    from math import floor, ceil
+    limit = raw_price * (1.0 + direction * ratio)
+    if direction > 0:
+        return floor(limit * 100) / 100.0   # 涨停: 向下取整
+    else:
+        return ceil(limit * 100) / 100.0    # 跌停: 向上取整
 
 
 def is_one_shot_limit(board_type: str, open_px: float, high_px: float,
-                       low_px: float, close_px: float, prev_close: float) -> bool:
+                       low_px: float, close_px: float, prev_close: float,
+                       raw_prev_close: float = None) -> bool:
     """
     Detect 一字板 (one-shot limit): open = high = low = close = limit price.
 
-    Returns True if the bar is a locked limit board where NO trading is possible.
-    """
-    limit_ratio = LIMIT_RATIOS.get(board_type, 0.10)
-    limit_up_price = prev_close * (1.0 + limit_ratio)
-    limit_down_price = prev_close * (1.0 - limit_ratio)
+    Uses exact rounded limit prices (2dp) and tight 0.1% tolerance instead
+    of the previous 0.5% which caused false positives on near-limit bars.
 
-    # 一字涨停: all prices equal, at or above limit-up
-    prices_equal = (abs(open_px - high_px) < 0.001 and
-                    abs(high_px - low_px) < 0.001 and
-                    abs(low_px - close_px) < 0.001)
+    If raw_prev_close is provided, uses that for limit-price calculation
+    (de-rebased) instead of the adjusted prev_close.
+    """
+    base = raw_prev_close if raw_prev_close is not None else prev_close
+    limit_ratio = LIMIT_RATIOS.get(board_type, 0.10)
+    limit_up_price = _round_limit_price(base, limit_ratio, +1)
+    limit_down_price = _round_limit_price(base, limit_ratio, -1)
+
+    # 一字板: all four prices are effectively equal
+    spread = high_px - low_px
+    prices_equal = spread <= 0.002  # <= 0.002 yuan spread = effectively locked
+
     if prices_equal:
-        if abs(close_px - limit_up_price) <= limit_up_price * 0.005:
-            return True   # 一字涨停 → cannot buy
-        if abs(close_px - limit_down_price) <= limit_down_price * 0.005:
-            return True   # 一字跌停 → cannot sell
+        # Tight tolerance: 0.1% of limit price (not 0.5%)
+        tol_up = max(0.01, limit_up_price * 0.001)
+        tol_dn = max(0.01, abs(limit_down_price) * 0.001)
+        if abs(close_px - limit_up_price) <= tol_up:
+            return True   # 一字涨停
+        if abs(close_px - limit_down_price) <= tol_dn:
+            return True   # 一字跌停
 
     return False
 
 
-def limit_down_queue_probability() -> float:
+def limit_down_queue_probability(symbol: str = '', date_str: str = '') -> bool:
     """
-    Simulate limit-down queue disadvantage.
+    Deterministic pseudo-random 50% fill probability for limit-down queues.
 
-    When stop-loss triggers at limit-down open:
-      - 50% probability: filled at limit-down price today
-      - 50% probability: queued, unfilled (must retry next day at lower price)
+    Uses MD5 hash of (symbol + date) modulo 2 to produce a reproducible
+    50/50 binary outcome. Same (symbol, date) always returns the same result,
+    eliminating the non-determinism of random.random() in backtests.
 
-    Returns True if filled today, False if queued to tomorrow.
+    If symbol/date are empty, falls back to a simple hash of the current
+    microsecond for non-backtest (live) scenarios.
     """
-    import random
-    return random.random() < 0.50  # 50% fill probability
+    import hashlib
+    if symbol and date_str:
+        seed = f'{symbol}_{date_str}'
+    else:
+        import time
+        seed = f'fallback_{time.perf_counter_ns()}'
+    h = hashlib.md5(seed.encode()).hexdigest()
+    # Take last byte of hash, mod 2 → 0 or 1 (50% each)
+    return int(h[-2:], 16) % 2 == 0
 
 
 # =============================================================================
@@ -124,19 +163,19 @@ def detect_limits_vectorized(
     Returns:
         (is_limit_up, is_limit_down): boolean arrays
     """
-    limit_up_price = prev_close * (1.0 + limit_ratio)
-    limit_down_price = prev_close * (1.0 - limit_ratio)
+    limit_up_price = np.round(prev_close * (1.0 + limit_ratio), 2)
+    limit_down_price = np.round(prev_close * (1.0 - limit_ratio), 2)
 
     close = df['close'].values
     high = df['high'].values
     low = df['low'].values
 
-    # Limit-up: close is at or near limit up price, AND high ≈ close (封板)
-    # Use 0.5% tolerance for rounding
-    is_limit_up = (close >= limit_up_price * 0.995) & (high - close <= close * 0.002)
+    # Limit-up: close at/near limit-up price, high ≈ close (封板)
+    # Tight tolerance 0.1% (was 0.5%) with 2dp tick rounding
+    is_limit_up = (close >= limit_up_price * 0.999) & (high - close <= close * 0.002)
 
-    # Limit-down: low ≈ close at limit down
-    is_limit_down = (low <= limit_down_price * 1.005) & (close - low <= close * 0.002)
+    # Limit-down: low ≈ close at limit-down
+    is_limit_down = (low <= limit_down_price * 1.001) & (close - low <= close * 0.002)
 
     return is_limit_up, is_limit_down
 
@@ -154,6 +193,8 @@ def match_exits_vectorized(
     trailing_atr_mult: float = 2.0,
     limit_ratio: float = 0.10,
     slippage_entry: float = 0.001,
+    symbol: str = '',
+    entry_date: str = '',
 ) -> Dict:
     """
     Vectorized exit matching engine.
@@ -189,9 +230,10 @@ def match_exits_vectorized(
     prev_closes = np.roll(closes, 1)
     prev_closes[0] = entry_price  # First bar: use entry price as ref
 
-    # ---- Limit-up detection (vectorized) ----
+    # ---- Limit-up detection (vectorized, 0.1% tolerance) ----
     limit_up_price = prev_closes * (1.0 + limit_ratio)
-    is_limit_up = (closes >= limit_up_price * 0.995) & (highs - closes <= closes * 0.002)
+    limit_up_price = np.round(limit_up_price, 2)  # exact tick rounding
+    is_limit_up = (closes >= limit_up_price * 0.999) & (highs - closes <= closes * 0.002)
 
     # ---- Intraday drawdown from entry (vectorized) ----
     drawdown_pct = (entry_price - lows) / entry_price
@@ -215,10 +257,10 @@ def match_exits_vectorized(
                            abs(lows[i]-closes[i]) < 0.001)
             if prices_equal and closes[i] <= prev_closes[i] * 0.90:
                 # 一字跌停 opening — queue disadvantage
-                if not limit_down_queue_probability():
+                bar_date = str(df_future.index[i].date()) if hasattr(df_future.index[i], 'date') else str(df_future.index[i])
+                if not limit_down_queue_probability(symbol, bar_date):
                     gap_stop_hit[i] = False
                     gap_stop_price[i] = np.nan
-                    # Will be re-evaluated at tomorrow's open (carry to next bar)
                     continue
 
     # ---- Intra-bar stop hit ----
@@ -353,41 +395,21 @@ def match_entry_adaptive(
     signal_price: float,
     entry_zone: str = '',
     symbol: str = '000001',
-    vwap_available: bool = True,
+    raw_prev_close: float = None,
 ) -> Dict:
     """
     Adaptive entry execution — prevents limit-order misses in trending markets.
 
     Decision tree for the entry bar (T+1 execution day):
 
-      (A) 一字涨停 (open=close=limit-up)
-          → NO FILL. Queue disadvantage, cannot buy.
-
-      (B) Price touches entry_zone lower bound during the day
-          → FILL at limit price. Classic limit-order execution.
-
-      (C) Price NEVER touches entry_zone, BUT:
-            close ≤ signal_price × 1.03 (less than 3% gap-up)
-          → FORCE MARKET ORDER at VWAP (or daily close as proxy at 14:55).
-          Prevents missing the trade when stock gaps up modestly
-          and never pulls back.
-
-      (D) Price gaps up > 3% above signal_price without touching entry_zone
-          → NO FILL. Too expensive — wait for pullback.
-
-    Args:
-        df_entry_day: single-bar DataFrame for the execution day [o,h,l,c,v]
-        signal_price: price at time of signal generation (reference)
-        entry_zone: string like "10.50-10.60" from local_trade_plan
-        symbol: stock code (for limit ratio)
-        vwap_available: if True, use VWAP proxy (OHLC avg); else use close
-
-    Returns:
-        Dict with:
-          - filled: bool
-          - fill_price: float or None
-          - fill_type: 'limit' | 'market_force' | 'none'
-          - fill_reason: str
+      (A) 一字涨停 → NO FILL. Queue disadvantage, cannot buy.
+      (B) Price touches entry_zone → FILL at limit price.
+      (C) Price never touches entry_zone, gap ≤ 3% → FORCE MARKET at CLOSE.
+          *** FIXED: Uses close_px only (no VWAP lookahead). ***
+          In real trading, only at market close can you confirm the stock
+          never pulled back to your limit. The (O+H+L+C)/4 proxy required
+          knowing the full day's OHLC before the close — a lookahead bias.
+      (D) Gap > 3% → NO FILL. Too expensive, wait for pullback.
     """
     if df_entry_day is None or df_entry_day.empty:
         return {'filled': False, 'fill_price': None,
@@ -398,16 +420,16 @@ def match_entry_adaptive(
     high_px = float(bar['high'])
     low_px = float(bar['low'])
     close_px = float(bar['close'])
-    volume = float(bar.get('volume', 0))
-    prev_close = signal_price  # signal day close = reference for limit calc
+    prev_close = signal_price  # signal day close = reference
 
     limit_ratio = get_limit_ratio(symbol)
     board_type = 'main'
     if limit_ratio > 0.10:
-        board_type = 'gem' if symbol.startswith('30') else 'star'
+        board_type = 'gem' if str(symbol).startswith('30') else 'star'
 
     # ---- (A) One-shot limit-up → NO FILL ----
-    if is_one_shot_limit(board_type, open_px, high_px, low_px, close_px, prev_close):
+    if is_one_shot_limit(board_type, open_px, high_px, low_px, close_px,
+                          prev_close, raw_prev_close):
         return {
             'filled': False, 'fill_price': None,
             'fill_type': 'none',
@@ -418,41 +440,28 @@ def match_entry_adaptive(
     entry_lower, entry_upper = parse_entry_zone(entry_zone)
 
     # ---- (B) Limit order: price touched the entry zone ----
-    limit_touched = False
-    fill_at_limit = None
     if entry_lower is not None:
-        # Check if intraday low reaches the entry zone
         if low_px <= entry_upper and high_px >= entry_lower:
-            # Fill at the limit price (conservative: use entry_lower)
-            fill_at_limit = entry_lower
-            limit_touched = True
-
-    if limit_touched and fill_at_limit is not None:
-        return {
-            'filled': True,
-            'fill_price': round(fill_at_limit, 3),
-            'fill_type': 'limit',
-            'fill_reason': f'限价单成交 @ {fill_at_limit:.2f} (entry_zone={entry_zone})',
-        }
+            return {
+                'filled': True,
+                'fill_price': round(entry_lower, 3),
+                'fill_type': 'limit',
+                'fill_reason': f'限价单成交 @ {entry_lower:.2f} (entry_zone={entry_zone})',
+            }
 
     # ---- (C) & (D): Price never touched limit — evaluate forced market entry ----
     gap_pct = (close_px - signal_price) / signal_price
 
     if gap_pct <= 0.03:
-        # Modest gap-up (≤3%): acceptable → force market order
-        if vwap_available:
-            # VWAP proxy: (O+H+L+C)/4 — simple and robust
-            vwap_proxy = (open_px + high_px + low_px + close_px) / 4.0
-        else:
-            vwap_proxy = close_px  # Fallback: closing auction price
-
+        # Use CLOSE price only — no VWAP lookahead
+        # (O+H+L+C)/4 requires knowing the full day before close → future leak
         return {
             'filled': True,
-            'fill_price': round(vwap_proxy, 3),
+            'fill_price': round(close_px, 3),
             'fill_type': 'market_force',
             'fill_reason': (
                 f'未回调至entry_zone({entry_zone})，但gap={gap_pct:.1%}≤3% '
-                f'→ 强制市价成交 @ VWAP≈{vwap_proxy:.2f}'
+                f'→ 强制市价成交 @ close={close_px:.2f}'
             ),
         }
 

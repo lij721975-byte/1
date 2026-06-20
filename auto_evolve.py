@@ -34,10 +34,14 @@ BANNER = """
 """
 
 
-def select_liquid_pool(n: int, seed: int = None, verbose: bool = True) -> List[str]:
+def select_liquid_pool(n: int, seed: int = None, verbose: bool = True,
+                        cutoff_date: date = None) -> List[str]:
     """
     Randomly select N liquid stocks from the full pool.
-    Filters by: avg daily amount > MIN_DAILY_AMOUNT, data >= 60 bars.
+
+    Filters by avg daily amount > MIN_DAILY_AMOUNT using data UP TO cutoff_date.
+    If cutoff_date is provided, uses the 20 bars before that date (eliminates
+    survivorship bias and lookahead from using "today's" liquidity snapshot).
     """
     if seed is not None:
         random.seed(seed)
@@ -56,12 +60,19 @@ def select_liquid_pool(n: int, seed: int = None, verbose: bool = True) -> List[s
             break
         scanned += 1
         try:
-            df = get_daily_kline(sym, days=120)
+            df = get_daily_kline(sym, days=250)
             if df is None or df.empty or len(df) < 60:
+                continue
+            # ---- Anti-lookahead: slice to cutoff_date ----
+            if cutoff_date is not None:
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    df.index = pd.DatetimeIndex(df.index)
+                df = df[df.index <= pd.Timestamp(cutoff_date)]
+            if len(df) < 20:
                 continue
             avg_vol_lots = float(df['volume'].tail(20).mean())
             avg_close = float(df['close'].tail(20).mean())
-            avg_amount = avg_vol_lots * 100 * avg_close  # Convert lots→shares
+            avg_amount = avg_vol_lots * 100 * avg_close
             if avg_amount >= MIN_DAILY_AMOUNT:
                 liquid.append(sym)
         except Exception:
@@ -70,7 +81,8 @@ def select_liquid_pool(n: int, seed: int = None, verbose: bool = True) -> List[s
             break
 
     if verbose:
-        print(f"[Pool] Scanned {scanned} stocks, found {len(liquid)} liquid (target={n})")
+        print(f"[Pool] Scanned {scanned} stocks, found {len(liquid)} liquid "
+              f"(target={n}, cutoff={'today' if cutoff_date is None else str(cutoff_date)})")
     return sorted(liquid)
 
 
@@ -168,15 +180,15 @@ def main():
             print('[ERROR] Pool file must define SELECTED_POOL or WATCHLIST')
             sys.exit(1)
         print(f"[Pool] Loaded {len(pool)} stocks from {args.pool_file}")
-    else:
-        pool = select_liquid_pool(args.stocks, seed=args.seed)
+    # ---- Date range (computed BEFORE pool selection to avoid lookahead) ----
+    end_date = date.today()
+    start_date = end_date - timedelta(days=args.days)
+
+    if not args.pool_file:
+        pool = select_liquid_pool(args.stocks, seed=args.seed, cutoff_date=start_date)
         if len(pool) < 10:
             print(f"[ERROR] Only {len(pool)} liquid stocks found. Lower MIN_DAILY_AMOUNT or check data.")
             sys.exit(1)
-
-    # ---- Date range ----
-    end_date = date.today()
-    start_date = end_date - timedelta(days=args.days)
 
     # ---- Initialize DB ----
     init_db()

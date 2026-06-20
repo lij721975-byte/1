@@ -1588,16 +1588,21 @@ class BacktestEngine:
         Record equity = cash + market value of all open positions (at today's close).
         """
         total = self.cash
+        today_ts = pd.Timestamp(today)
         for sym, pos in self.positions.items():
             df = self.all_daily_data.get(sym)
             if df is None or df.empty:
                 total += pos['shares'] * pos['entry_price']  # fallback
                 continue
 
-            today_bar = df[df.index == pd.Timestamp(today)]
+            today_bar = df[df.index == today_ts]
             if today_bar.empty:
-                # Use last known price
-                last_close = float(df['close'].iloc[-1])
+                # Stock suspended: use last close BEFORE today, NOT iloc[-1]
+                df_sliced = df[df.index <= today_ts]
+                if not df_sliced.empty:
+                    last_close = float(df_sliced['close'].iloc[-1])
+                else:
+                    last_close = pos['entry_price']
                 total += pos['shares'] * last_close
             else:
                 close_price = float(today_bar.iloc[0]['close'])

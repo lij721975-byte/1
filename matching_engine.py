@@ -81,22 +81,19 @@ def is_one_shot_limit(board_type: str, open_px: float, high_px: float,
     If raw_prev_close is provided, uses that for limit-price calculation
     (de-rebased) instead of the adjusted prev_close.
     """
-    base = raw_prev_close if raw_prev_close is not None else prev_close
     limit_ratio = LIMIT_RATIOS.get(board_type, 0.10)
-    limit_up_price = _round_limit_price(base, limit_ratio, +1)
-    limit_down_price = _round_limit_price(base, limit_ratio, -1)
 
-    # 一字板: all four prices are effectively equal
+    # QFQ-safe: use return ratio, not absolute price rounding
+    ret = (close_px - prev_close) / prev_close
+
+    # 一字板: all four prices effectively equal, return at ±limit_ratio
     spread = high_px - low_px
-    prices_equal = spread <= 0.002  # <= 0.002 yuan spread = effectively locked
+    prices_equal = spread <= 0.002
 
     if prices_equal:
-        # Tight tolerance: 0.1% of limit price (not 0.5%)
-        tol_up = max(0.01, limit_up_price * 0.001)
-        tol_dn = max(0.01, abs(limit_down_price) * 0.001)
-        if abs(close_px - limit_up_price) <= tol_up:
+        if ret >= limit_ratio - 0.003:
             return True   # 一字涨停
-        if abs(close_px - limit_down_price) <= tol_dn:
+        if ret <= -(limit_ratio - 0.003):
             return True   # 一字跌停
 
     return False
@@ -163,19 +160,19 @@ def detect_limits_vectorized(
     Returns:
         (is_limit_up, is_limit_down): boolean arrays
     """
-    limit_up_price = np.round(prev_close * (1.0 + limit_ratio), 2)
-    limit_down_price = np.round(prev_close * (1.0 - limit_ratio), 2)
-
+    # QFQ-safe ratio-based detection — NO absolute price rounding.
+    # QFQ-adjusted prices break 2dp tick rounding; use pure return-ratio logic.
     close = df['close'].values
     high = df['high'].values
     low = df['low'].values
 
-    # Limit-up: close at/near limit-up price, high ≈ close (封板)
-    # Tight tolerance 0.1% (was 0.5%) with 2dp tick rounding
-    is_limit_up = (close >= limit_up_price * 0.999) & (high - close <= close * 0.002)
+    ret = (close - prev_close) / prev_close  # day return
 
-    # Limit-down: low ≈ close at limit-down
-    is_limit_down = (low <= limit_down_price * 1.001) & (close - low <= close * 0.002)
+    # Limit-up: close at ~+limit_ratio (within 0.3% tolerance), high ≈ close
+    is_limit_up = (ret >= limit_ratio - 0.003) & (high - close <= close * 0.002)
+
+    # Limit-down: close at ~-limit_ratio, low ≈ close
+    is_limit_down = (ret <= -(limit_ratio - 0.003)) & (close - low <= close * 0.002)
 
     return is_limit_up, is_limit_down
 
@@ -230,10 +227,9 @@ def match_exits_vectorized(
     prev_closes = np.roll(closes, 1)
     prev_closes[0] = entry_price  # First bar: use entry price as ref
 
-    # ---- Limit-up detection (vectorized, 0.1% tolerance) ----
-    limit_up_price = prev_closes * (1.0 + limit_ratio)
-    limit_up_price = np.round(limit_up_price, 2)  # exact tick rounding
-    is_limit_up = (closes >= limit_up_price * 0.999) & (highs - closes <= closes * 0.002)
+    # ---- Limit-up detection (QFQ-safe: pure return ratio, NO rounding) ----
+    rets = (closes - prev_closes) / prev_closes
+    is_limit_up = (rets >= limit_ratio - 0.003) & (highs - closes <= closes * 0.002)
 
     # ---- Intraday drawdown from entry (vectorized) ----
     drawdown_pct = (entry_price - lows) / entry_price

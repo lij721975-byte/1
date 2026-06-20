@@ -1317,11 +1317,16 @@ class BacktestEngine:
         try:
             from execution_algos import execute_with_vwap
             # Use total equity (not just cash) for VWAP eligibility check
+            today_ts_vwap = pd.Timestamp(today)
             positions_value_pre = 0.0
             for sym_p, pos_p in self.positions.items():
                 df_p = self.all_daily_data.get(sym_p)
                 if df_p is not None and not df_p.empty:
-                    positions_value_pre += pos_p['shares'] * float(df_p['close'].iloc[-1])
+                    df_sliced_v = df_p[df_p.index <= today_ts_vwap]
+                    if not df_sliced_v.empty:
+                        positions_value_pre += pos_p['shares'] * float(df_sliced_v['close'].iloc[-1])
+                    else:
+                        positions_value_pre += pos_p['shares'] * pos_p['entry_price']
                 else:
                     positions_value_pre += pos_p['shares'] * pos_p['entry_price']
             pre_equity = self.cash + positions_value_pre
@@ -1356,12 +1361,17 @@ class BacktestEngine:
             adjusted_pct *= 0.50
             adjusted_pct = max(MIN_POSITION_PCT, adjusted_pct)
 
-        # Step 0: compute total equity (cash + mark-to-market positions)
+        # Step 0: compute total equity (cash + mark-to-market positions at TODAY)
+        today_ts = pd.Timestamp(today)
         positions_value = 0.0
         for sym_p, pos_p in self.positions.items():
             df_p = self.all_daily_data.get(sym_p)
             if df_p is not None and not df_p.empty:
-                last_close_p = float(df_p['close'].iloc[-1])
+                df_sliced = df_p[df_p.index <= today_ts]
+                if not df_sliced.empty:
+                    last_close_p = float(df_sliced['close'].iloc[-1])
+                else:
+                    last_close_p = pos_p['entry_price']
                 positions_value += pos_p['shares'] * last_close_p
             else:
                 positions_value += pos_p['shares'] * pos_p['entry_price']

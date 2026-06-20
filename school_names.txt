@@ -1,0 +1,13 @@
+school_chanlun        缠论
+school_tang           唐能通
+school_livermore      李佛摩
+school_busch          布殊
+school_classical      经典技术分析
+school_risk           风险管理
+school_gann           江恩
+school_wyckoff        威科夫
+school_harmonic       谐波形态
+school_orderflow      订单流+VWAP策略
+school_roc_breakout   ROC动量突破策略
+school_volume_profile 成交量分布策略
+school_fusion         蒸馏融合策略(Fusion)

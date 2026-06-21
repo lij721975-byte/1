@@ -204,8 +204,26 @@ class MLFeaturePipeline:
 
         # ---- Step 3: Pre-compute forward returns on full df ----
         df['t1_open'] = df['open'].shift(-1)
+        df['t1_high'] = df['high'].shift(-1)
+        df['t1_low']  = df['low'].shift(-1)
         df['t5_close'] = df['close'].shift(-forward_days)
         df['fwd_ret_5d'] = df['t5_close'] / df['t1_open'] - 1
+
+        # Simulate stop-loss: if max drawdown during holding period (T+1..T+forward)
+        # exceeds -stop_loss_pct, override return to -stop_loss_pct
+        df['fwd_min_low'] = df['low'].shift(-1)[::-1].rolling(
+            window=forward_days, min_periods=1).min()[::-1]
+        df['max_fwd_dd'] = df['fwd_min_low'] / df['t1_open'] - 1
+        stop_loss_pct = 0.05
+        stop_mask = df['max_fwd_dd'] <= -stop_loss_pct
+        df.loc[stop_mask, 'fwd_ret_5d'] = -stop_loss_pct
+
+        # Filter untradeable labels: T+1 一字涨停 → cannot buy → NaN target
+        from matching_engine import get_limit_ratio
+        lr = get_limit_ratio(sym)
+        limit_up_mask = (df['t1_open'] >= df['close'] * (1.0 + lr - 0.003)) & \
+                        (df['t1_high'] == df['t1_low'])
+        df.loc[limit_up_mask, 'fwd_ret_5d'] = np.nan
 
         # ---- Step 4: For each sample date, compute ensemble snapshots ----
         for sample_date in sample_dates:
@@ -343,9 +361,10 @@ class MLFeaturePipeline:
             if not isinstance(bm_df.index, pd.DatetimeIndex):
                 bm_df.index = pd.to_datetime(bm_df.index)
             bm_df = bm_df.sort_index()
-            bm_df['bm_ret_5d'] = (
-                bm_df['close'].shift(-self.forward_days) / bm_df['close'] - 1
-            )
+            # Align with stock timeline: T+1 open → T+forward_days close
+            bm_df['t1_open'] = bm_df['open'].shift(-1)
+            bm_df['t5_close'] = bm_df['close'].shift(-self.forward_days)
+            bm_df['bm_ret_5d'] = bm_df['t5_close'] / bm_df['t1_open'] - 1
             for idx, row in bm_df.iterrows():
                 d = idx.date() if hasattr(idx, 'date') else pd.Timestamp(idx).date()
                 val = row.get('bm_ret_5d', np.nan)
@@ -551,54 +570,7 @@ def train_xgb_from_parquet(
         return wf
 
     wf = WalkForwardXGB(window_size=window_size, step_size=step_size)
-
-    # Manually run walk-forward training
-    from walk_forward_xgb import generate_purged_splits
-    from sklearn.preprocessing import RobustScaler
-    import xgboost as xgb
-
-    n_splits = 0
-    wf.feature_names = feature_cols
-
-    for train_idx, test_idx in generate_purged_splits(
-        df_panel, window_size=window_size, step_size=step_size,
-        gap_days=wf.gap_days, min_train_size=wf.min_train_size,
-    ):
-        train_mask = df_panel.index.isin(train_idx)
-        test_mask = df_panel.index.isin(test_idx)
-
-        X_train = X[train_mask]
-        X_test = X[test_mask]
-        y_train = y[train_mask]
-        y_test = y[test_mask]
-
-        if len(X_train) < wf.min_train_size or len(X_test) < 10:
-            continue
-
-        pos_ratio = y_train.mean()
-        if pos_ratio < 0.15 or pos_ratio > 0.85:
-            continue
-
-        # 防护 1: Per-split RobustScaler (fit on train only)
-        scaler = RobustScaler(quantile_range=(5, 95))
-        X_train_s = scaler.fit_transform(X_train)
-        X_test_s = scaler.transform(X_test)
-
-        # 防护 2: binary:logistic
-        model = xgb.XGBClassifier(**wf.xgb_params)
-        model.fit(X_train_s, y_train, eval_set=[(X_test_s, y_test)], verbose=False)
-
-        # 防护 3: Factor collapse detection
-        collapse_warning = wf._check_feature_dominance(model, feature_cols, n_splits)
-        if collapse_warning:
-            wf.xgb_params['colsample_bytree'] = max(0.30, wf.xgb_params.get('colsample_bytree', 0.60) - 0.10)
-            wf.xgb_params['reg_alpha'] = min(2.0, wf.xgb_params.get('reg_alpha', 0.5) + 0.30)
-            print(f"  [FactorCollapse] Window {n_splits+1}: {collapse_warning}")
-
-        wf._models.append(model)
-        wf._model_dates.append((train_idx[0], train_idx[-1], test_idx[0], test_idx[-1]))
-        wf._last_train_date = train_idx[-1]
-        n_splits += 1
+    wf.fit_walk_forward(df_panel, feature_cols=feature_cols, target_col='target_y')
 
     _GLOBAL_XGB_MODEL = wf
     return wf

@@ -154,7 +154,8 @@ def _precompute_stock_worker(args):
                 'date': date_obj,
                 **ohlcv,
                 'indicators': indicators,
-                'ensemble': ensemble,
+                # ensemble NOT cached — always computed fresh in compute_daily_signals
+                # so that dynamically-evolving school weights take effect
             }
 
     return results
@@ -236,7 +237,7 @@ def _precompute_chunk_worker(args):
 
             results[cache_key] = {
                 'symbol': symbol, 'date': date_obj,
-                **ohlcv, 'indicators': indicators, 'ensemble': ensemble,
+                **ohlcv, 'indicators': indicators,
             }
 
     return results
@@ -280,6 +281,7 @@ class BacktestEngine:
         max_positions: int = 10,
         confidence_threshold: float = 0.08,
         precomputed_data: Dict[str, pd.DataFrame] = None,
+        precomputed_indicators: Dict[str, Optional[Dict[str, Any]]] = None,
     ) -> None:
         self.stock_pool: List[str] = stock_pool if stock_pool is not None else list(STOCK_POOL)
         self.start_date: Optional[date] = start_date
@@ -292,12 +294,15 @@ class BacktestEngine:
         self.confidence_threshold: float = float(confidence_threshold)
 
         # ---- Runtime state ----
-        # External cache: if provided, bypass disk I/O entirely
+        # External data cache: if provided, bypass disk I/O entirely
         if precomputed_data is not None:
             self.all_daily_data: Dict[str, pd.DataFrame] = precomputed_data
         else:
             self.all_daily_data: Dict[str, pd.DataFrame] = {}
         self.all_hourly_data: Dict[str, pd.DataFrame] = {}
+        # Indicator cache: pre-computed indicators (no ensemble — fresh each time)
+        self.indicator_cache: Dict[str, Optional[Dict[str, Any]]] = \
+            precomputed_indicators if precomputed_indicators is not None else {}
         self.trading_days: List[date] = []
         self.cash: float = self.initial_capital
         self.positions: Dict[str, Dict[str, Any]] = {}
@@ -630,10 +635,11 @@ class BacktestEngine:
                 chunk_idx = futures[fut]
                 try:
                     r = fut.result()
-                    self.signal_cache.update(r)
+                    # Store in indicator_cache (no ensemble — computed fresh later)
+                    self.indicator_cache.update(r)
                     done_count = sum(1 for v in r.values() if v is not None)
                     print(f"  [Precompute] Chunk {chunk_idx+1}/{len(chunks)} "
-                          f"→ {done_count} signals")
+                          f"→ {done_count} indicators cached")
                 except Exception as e:
                     print(f"  [Precompute] Chunk {chunk_idx+1} FAILED: {e}")
 
@@ -648,69 +654,79 @@ class BacktestEngine:
         date_obj: date,
     ) -> Optional[Dict[str, Any]]:
         """
-        Compute indicators and expert-ensemble signal for *symbol* using
-        only data up to (and including) *date_obj*.
+        Compute indicators and expert-ensemble signal for *symbol*.
 
-        Returns a dict with keys:
-            symbol, date, open, high, low, close, volume,
-            indicators, ensemble
-        or ``None`` if data is insufficient.
+        Indicator cache (self.indicator_cache): pre-computed indicators are
+        reused across Walk-Forward windows.  Ensemble is ALWAYS computed
+        fresh so dynamically-evolving school weights take effect.
         """
         cache_key = f"{symbol}_{date_obj.isoformat()}"
+
+        # ---- Step 0: Check result cache (full signal) ----
         if cache_key in self.signal_cache:
             return self.signal_cache[cache_key]
 
-        df = self.all_daily_data.get(symbol)
-        if df is None or df.empty:
-            self.signal_cache[cache_key] = None
-            return None
+        # ---- Step 1: Check indicator cache (pre-computed, no ensemble) ----
+        cached_entry = self.indicator_cache.get(cache_key)
+        if cached_entry is not None:
+            indicators = cached_entry.get('indicators')
+            ohlcv = {k: cached_entry[k] for k in ('open','high','low','close','volume')
+                     if k in cached_entry}
+        else:
+            # ---- Step 2: Compute indicators from scratch ----
+            df = self.all_daily_data.get(symbol)
+            if df is None or df.empty:
+                self.signal_cache[cache_key] = None
+                return None
 
-        ts = pd.Timestamp(date_obj)
-        df_sliced = df[df.index <= ts]
-        if len(df_sliced) < 60:
-            self.signal_cache[cache_key] = None
-            return None
+            ts = pd.Timestamp(date_obj)
+            df_sliced = df[df.index <= ts]
+            if len(df_sliced) < 60:
+                self.signal_cache[cache_key] = None
+                return None
 
-        # Last row OHLCV
-        last_row = df_sliced.iloc[-1]
-        ohlcv = {
-            'open': float(last_row['open']),
-            'high': float(last_row['high']),
-            'low': float(last_row['low']),
-            'close': float(last_row['close']),
-            'volume': float(last_row['volume']),
-        }
+            last_row = df_sliced.iloc[-1]
+            ohlcv = {
+                'open': float(last_row['open']),
+                'high': float(last_row['high']),
+                'low': float(last_row['low']),
+                'close': float(last_row['close']),
+                'volume': float(last_row['volume']),
+            }
 
-        # Indicators — slice hourly data and resample to 60-min for multi-timeframe
-        df_60min = None
-        if symbol in self.all_hourly_data:
-            hdf = self.all_hourly_data[symbol]
-            h_sliced = hdf[hdf.index <= ts]
-            if len(h_sliced) >= 60:
-                df_60min = resample_5min_to_60min(h_sliced)
+            df_60min = None
+            if symbol in self.all_hourly_data:
+                hdf = self.all_hourly_data[symbol]
+                h_sliced = hdf[hdf.index <= ts]
+                if len(h_sliced) >= 60:
+                    df_60min = resample_5min_to_60min(h_sliced)
 
-        try:
-            indicators = compute_all_indicators_v2(df_sliced, df_60min, None, symbol=symbol)
-        except Exception as e:
-            print(f"  [WARN] Indicator computation failed for {symbol} @ {date_obj}: {e}")
-            self.signal_cache[cache_key] = None
-            return None
+            try:
+                indicators = compute_all_indicators_v2(df_sliced, df_60min, None, symbol=symbol)
+            except Exception:
+                self.signal_cache[cache_key] = None
+                return None
 
-        if indicators is None:
-            self.signal_cache[cache_key] = None
-            return None
+            if indicators is None:
+                self.signal_cache[cache_key] = None
+                return None
 
-        # Ensemble
+            # Store in indicator cache for future reuse
+            self.indicator_cache[cache_key] = {
+                'symbol': symbol, 'date': date_obj, **ohlcv,
+                'indicators': indicators,
+            }
+
+        # ---- Step 3: Ensemble ALWAYS computed fresh ----
+        # This picks up dynamically-evolved school weights from DB
         try:
             ensemble = compute_expert_ensemble(indicators)
-        except Exception as e:
-            print(f"  [WARN] Ensemble computation failed for {symbol} @ {date_obj}: {e}")
+        except Exception:
             self.signal_cache[cache_key] = None
             return None
 
         result: Dict[str, Any] = {
-            'symbol': symbol,
-            'date': date_obj,
+            'symbol': symbol, 'date': date_obj,
             **ohlcv,
             'indicators': indicators,
             'ensemble': ensemble,
@@ -1052,7 +1068,7 @@ class BacktestEngine:
                         today_bar=df_slice.iloc[-1:],
                     )
                     self.trades.append(trade)
-                    self.cash += pos['shares'] * replay['exit_price']
+                    self.cash += pos['shares'] * replay['exit_price'] * (1.0 - COMMISSION - STAMP_DUTY)
                     closed_symbols.append(sym)
                     # Set cooldown after exit
                     self._cooldown[sym] = today + timedelta(days=COOLDOWN_DAYS)
@@ -1212,7 +1228,7 @@ class BacktestEngine:
                                     pos, exit_px, today, 'drawdown_breaker',
                                     today_bar=today_b)
                                 self.trades.append(trade)
-                                self.cash += pos['shares'] * exit_px
+                                self.cash += pos['shares'] * exit_px * (1.0 - COMMISSION - STAMP_DUTY)
                     self.positions.clear()
                     break
 
@@ -1240,7 +1256,7 @@ class BacktestEngine:
                 exit_price = float(last_bar.iloc[-1]['close'])
                 trade = self._close_position(pos, exit_price, last_day, reason='end_of_backtest')
                 self.trades.append(trade)
-                self.cash += pos['shares'] * exit_price
+                self.cash += pos['shares'] * exit_price * (1.0 - COMMISSION - STAMP_DUTY)
             self.positions.clear()
             self._update_equity(last_day)
 
@@ -1288,63 +1304,44 @@ class BacktestEngine:
         next_trading_day: date,
     ) -> None:
         """
-        Open a long position at *next_trading_day*'s open price.
+        Open a long position at *next_trading_day*, using match_entry_adaptive
+        for limit-order execution (anti-gap-up chasing).
 
         Called when a pending entry from *today* reaches its execution date.
-        Skips the position if the entry bar is limit-locked or shares round
-        to zero.
+        Skips the position if the matching engine rejects the fill or shares
+        round to zero.
         """
         df = self.all_daily_data.get(symbol)
         if df is None or df.empty:
             return
 
+        # ---- Extract signal-day close (reference price for gap detection) ----
+        today_bar = df[df.index == pd.Timestamp(today)]
+        if today_bar.empty:
+            return
+        signal_price = float(today_bar.iloc[0]['close'])
+
+        # ---- Extract execution-day bar for matching engine ----
         next_bar = df[df.index == pd.Timestamp(next_trading_day)]
         if next_bar.empty:
             return
 
-        bar = next_bar.iloc[0]
-        entry_price = float(bar['open'])
+        # ---- Extract entry_zone from local trade plan ----
+        local_plan = signal.get('local_plan', {})
+        entry_zone = str(local_plan.get('entry_zone', ''))
 
-        # Guard: skip if price data is invalid (zero, NaN, or negative)
-        if entry_price <= 0 or np.isnan(entry_price):
+        # ---- Matching engine: limit-order execution (anti-gap-up chasing) ----
+        from matching_engine import match_entry_adaptive
+        exec_result = match_entry_adaptive(
+            df_entry_day=next_bar,
+            signal_price=signal_price,
+            entry_zone=entry_zone,
+            symbol=symbol,
+        )
+        if not exec_result.get('filled'):
             return
-
-        # Limit-lock check
-        locked, lock_type = _is_limit_locked(bar, 'bullish')
-        if locked:
-            return
-
-        # ---- VWAP execution for large orders (>100万 RMB) ----
-        raw_price = entry_price
-        vwap_info = None
-        try:
-            from execution_algos import execute_with_vwap
-            # Use total equity (not just cash) for VWAP eligibility check
-            today_ts_vwap = pd.Timestamp(today)
-            positions_value_pre = 0.0
-            for sym_p, pos_p in self.positions.items():
-                df_p = self.all_daily_data.get(sym_p)
-                if df_p is not None and not df_p.empty:
-                    df_sliced_v = df_p[df_p.index <= today_ts_vwap]
-                    if not df_sliced_v.empty:
-                        positions_value_pre += pos_p['shares'] * float(df_sliced_v['close'].iloc[-1])
-                    else:
-                        positions_value_pre += pos_p['shares'] * pos_p['entry_price']
-                else:
-                    positions_value_pre += pos_p['shares'] * pos_p['entry_price']
-            pre_equity = self.cash + positions_value_pre
-            est_value = pre_equity * self.position_pct
-            if est_value >= 1_000_000:
-                q_vwap = self._stock_quality.get(symbol, {})
-                adv_shares_vwap = int(q_vwap.get('avg_vol', 1000000))
-                vwap_info = execute_with_vwap(est_value, 0, raw_price,
-                                              adv_shares_vwap, q_vwap.get('atr_pct', 0.03))
-                vwap_px = vwap_info.get('execution_price', 0)
-                if vwap_px > 0 and not np.isnan(vwap_px):
-                    entry_price = vwap_px
-                # else: keep original entry_price (VWAP returned invalid — fallback)
-        except ImportError:
-            pass
+        entry_price = float(exec_result['fill_price'])
+        fill_type = exec_result.get('fill_type', 'market_force')
 
         # ---- Position sizing ----
         if VOL_ADAPTIVE_SIZING:
@@ -1356,9 +1353,7 @@ class BacktestEngine:
         else:
             adjusted_pct = self.position_pct
 
-        # === TASK 2: Dynamic Risk Budgeting ===
-        # In bearish/neutral regimes, halve position size.
-        # "敢于试错，但绝不重仓"
+        # Dynamic Risk Budgeting: halve position in bearish/neutral regimes
         mkt_features = signal.get('_market_features', {})
         if mkt_features.get('regime_bearish') or mkt_features.get('regime_neutral'):
             adjusted_pct *= 0.50
@@ -1382,10 +1377,9 @@ class BacktestEngine:
 
         # Step 1: compute target purchase amount from total equity
         target_amount = total_equity * adjusted_pct
-
-        # Cash constraint: cannot spend more than available cash
-        if target_amount > self.cash:
-            target_amount = self.cash
+        # Reserve 0.03% fee buffer to prevent cash overdraft
+        max_buy_value = min(target_amount, self.cash / 1.0003)
+        target_amount = max_buy_value
 
         raw_price = entry_price
         if raw_price <= 0 or np.isnan(raw_price) or target_amount < raw_price * A_SHARE_LOT_SIZE:
@@ -1413,6 +1407,7 @@ class BacktestEngine:
             return
 
         # Volume constraint: max 5% of today's total volume (anti-infinite-liquidity)
+        bar = next_bar.iloc[0]
         day_volume = int(bar.get('volume', 0))
         max_fill = int(day_volume * 0.05)
         if max_fill > 0 and shares > max_fill:
@@ -1503,7 +1498,7 @@ class BacktestEngine:
             'chandelier_stop': chandelier_initial_stop,
         }
         self.positions[symbol] = pos
-        self.cash -= shares * entry_price
+        self.cash -= shares * entry_price * (1.0 + COMMISSION)
 
     def _close_position(
         self,
@@ -1532,9 +1527,9 @@ class BacktestEngine:
 
             if is_stop and is_target:
                 # 薛定谔悲观优先：同一天既触止损又触止盈 → 按止损
-                exit_price = min(open_p, pos.get('stop_loss', exit_price))
+                exit_price = min(open_p, exit_price)
             elif is_stop:
-                exit_price = min(open_p, pos.get('stop_loss', exit_price))
+                exit_price = min(open_p, exit_price)
             elif is_target:
                 exit_price = max(open_p, pos.get('target_price', exit_price))
 

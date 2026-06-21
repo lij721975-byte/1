@@ -71,32 +71,29 @@ def _round_limit_price(raw_price: float, ratio: float, direction: int) -> float:
 
 def is_one_shot_limit(board_type: str, open_px: float, high_px: float,
                        low_px: float, close_px: float, prev_close: float,
-                       raw_prev_close: float = None) -> bool:
+                       raw_prev_close: float = None) -> int:
     """
     Detect 一字板 (one-shot limit): open = high = low = close = limit price.
 
-    Uses exact rounded limit prices (2dp) and tight 0.1% tolerance instead
-    of the previous 0.5% which caused false positives on near-limit bars.
+    Returns integer status:
+       1  = 一字涨停 (limit-up locked)   — cannot buy, queue disadvantage
+      -1  = 一字跌停 (limit-down locked) — buyer fills instantly at open
+       0  = not a one-shot limit board
 
-    If raw_prev_close is provided, uses that for limit-price calculation
-    (de-rebased) instead of the adjusted prev_close.
+    QFQ-safe: uses return ratio, not absolute price rounding.
     """
     limit_ratio = LIMIT_RATIOS.get(board_type, 0.10)
-
-    # QFQ-safe: use return ratio, not absolute price rounding
     ret = (close_px - prev_close) / prev_close
-
-    # 一字板: all four prices effectively equal, return at ±limit_ratio
     spread = high_px - low_px
     prices_equal = spread <= 0.002
 
     if prices_equal:
         if ret >= limit_ratio - 0.003:
-            return True   # 一字涨停
+            return 1    # 一字涨停
         if ret <= -(limit_ratio - 0.003):
-            return True   # 一字跌停
+            return -1   # 一字跌停
 
-    return False
+    return 0
 
 
 def limit_down_queue_probability(symbol: str = '', date_str: str = '') -> bool:
@@ -423,21 +420,23 @@ def match_entry_adaptive(
     if limit_ratio > 0.10:
         board_type = 'gem' if str(symbol).startswith('30') else 'star'
 
-    # ---- (A) One-shot limit-up → NO FILL ----
-    if is_one_shot_limit(board_type, open_px, high_px, low_px, close_px,
-                          prev_close, raw_prev_close):
+    # ---- (A) One-shot limit-up → NO FILL (limit-down → buyer fills instantly) ----
+    limit_status = is_one_shot_limit(board_type, open_px, high_px, low_px,
+                                      close_px, prev_close, raw_prev_close)
+    if limit_status == 1:
         return {
             'filled': False, 'fill_price': None,
             'fill_type': 'none',
             'fill_reason': f'一字涨停封板 @ {close_px:.2f} — 排队劣势，无法买入',
         }
+    # limit_status == -1: 一字跌停 → buyer fills instantly, fall through to (B)/(C)
 
     # ---- Parse entry zone ----
     entry_lower, entry_upper = parse_entry_zone(entry_zone)
 
     # ---- (B) Limit order: price touched the entry zone ----
     if entry_lower is not None:
-        if low_px <= entry_upper and high_px >= entry_lower:
+        if low_px < entry_upper and high_px >= entry_lower:
             return {
                 'filled': True,
                 'fill_price': round(entry_lower, 3),

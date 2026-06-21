@@ -279,6 +279,7 @@ class BacktestEngine:
         target_pct: float = DEFAULT_TARGET_PCT,
         max_positions: int = 10,
         confidence_threshold: float = 0.08,
+        precomputed_data: Dict[str, pd.DataFrame] = None,
     ) -> None:
         self.stock_pool: List[str] = stock_pool if stock_pool is not None else list(STOCK_POOL)
         self.start_date: Optional[date] = start_date
@@ -291,7 +292,11 @@ class BacktestEngine:
         self.confidence_threshold: float = float(confidence_threshold)
 
         # ---- Runtime state ----
-        self.all_daily_data: Dict[str, pd.DataFrame] = {}
+        # External cache: if provided, bypass disk I/O entirely
+        if precomputed_data is not None:
+            self.all_daily_data: Dict[str, pd.DataFrame] = precomputed_data
+        else:
+            self.all_daily_data: Dict[str, pd.DataFrame] = {}
         self.all_hourly_data: Dict[str, pd.DataFrame] = {}
         self.trading_days: List[date] = []
         self.cash: float = self.initial_capital
@@ -301,6 +306,8 @@ class BacktestEngine:
         self.signal_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         # Per-stock quality cache: trend OK, avg volume, avg amount, atr_pct
         self._stock_quality: Dict[str, Dict[str, float]] = {}
+        # Flag: skip precompute if data was externally injected (already cached)
+        self._data_injected: bool = precomputed_data is not None
 
     # ========================================================================
     # Data loading
@@ -734,7 +741,7 @@ class BacktestEngine:
             0=auto (parallel data load + signal precompute),
             1=serial, >1=explicit worker count.
         """
-        # ---- 1. Load data (threaded) ----
+        # ---- 1. Load data (skip if externally injected via precomputed_data) ----
         if not self.all_daily_data:
             self.load_all_data(workers=workers if workers != 1 else 0)
 
@@ -753,12 +760,15 @@ class BacktestEngine:
         self.equity_curve.clear()
         self.signal_cache.clear()
 
-        # ---- 2.5 Pre-compute all signals (parallel) ----
-        if workers != 1:
+        # ---- 2.5 Pre-compute all signals (skip if data was externally cached) ----
+        if workers != 1 and not self._data_injected:
             n_cached = self.precompute_signals_parallel(trading_days, workers=workers)
             if n_cached > 0 and verbose:
                 print(f"[Backtest] Using {n_cached} pre-computed signals "
                       f"({len(self.signal_cache)} cache slots)")
+        elif self._data_injected and verbose:
+            print(f"[Backtest] Using injected data cache "
+                  f"({len(self.all_daily_data)} stocks) — skipping I/O + precompute")
 
         # Signal pass-rate counters
         self._bullish_total = 0
@@ -1014,17 +1024,7 @@ class BacktestEngine:
                             replay['time_stopped'] = True
 
                 if replay['exit_price'] is not None:
-                    # ── Gap-down slippage for hard stop exits ──
-                    # If today opened BELOW the stop price (gap-down), the true
-                    # exit is at the open (first available price in T+1), not the
-                    # stop price.  min(stop, open) captures this correctly.
-                    if (replay.get('stopped_out') or replay.get('gap_stopped')
-                            or replay.get('chandelier_triggered')):
-                        today_bar_exit = df_slice.iloc[-1]
-                        today_open_exit = float(today_bar_exit['open'])
-                        replay['exit_price'] = min(replay['exit_price'], today_open_exit)
-
-                    # Apply slippage to exit price
+                    # Apply base slippage (gap-open correction is now in _close_position)
                     replay['exit_price'] = replay['exit_price'] * (1.0 - SLIPPAGE)
                     exit_reason = 'unknown'
                     if replay.get('chandelier_triggered'):
@@ -1049,6 +1049,7 @@ class BacktestEngine:
                         exit_price=replay['exit_price'],
                         exit_date=today,
                         reason=exit_reason,
+                        today_bar=df_slice.iloc[-1:],
                     )
                     self.trades.append(trade)
                     self.cash += pos['shares'] * replay['exit_price']
@@ -1207,7 +1208,9 @@ class BacktestEngine:
                             today_b = df_s[df_s.index == pd.Timestamp(today)]
                             if not today_b.empty:
                                 exit_px = float(today_b.iloc[0]['close']) * (1.0 - SLIPPAGE)
-                                trade = self._close_position(pos, exit_px, today, 'drawdown_breaker')
+                                trade = self._close_position(
+                                    pos, exit_px, today, 'drawdown_breaker',
+                                    today_bar=today_b)
                                 self.trades.append(trade)
                                 self.cash += pos['shares'] * exit_px
                     self.positions.clear()
@@ -1508,13 +1511,33 @@ class BacktestEngine:
         exit_price: float,
         exit_date: date,
         reason: str,
+        today_bar: Any = None,
     ) -> Dict[str, Any]:
         """
         Compute P&L for a closed position and return a trade record dict.
 
+        Gap-open correction (anti-slippage optimism):
+          - Stop-loss:    exit = min(open, stop_price)   — gap-down fills at open
+          - Take-profit:  exit = max(open, target_price) — gap-up fills at open
+          - Both hit:     exit = min(open, stop_price)   — 止损悲观优先
+
         Costs: stamp duty (0.1 % sell only) + commission (0.025 % per side).
         All closes logged to EventStore for crash recovery.
         """
+        # ── Gap-open correction ──
+        if today_bar is not None:
+            open_p = float(today_bar.iloc[0]['open'])
+            is_stop = any(kw in reason for kw in ('stop_loss', 'stopped', 'chandelier', 'gap_stop'))
+            is_target = 'target' in reason
+
+            if is_stop and is_target:
+                # 薛定谔悲观优先：同一天既触止损又触止盈 → 按止损
+                exit_price = min(open_p, pos.get('stop_loss', exit_price))
+            elif is_stop:
+                exit_price = min(open_p, pos.get('stop_loss', exit_price))
+            elif is_target:
+                exit_price = max(open_p, pos.get('target_price', exit_price))
+
         entry_price = pos['entry_price']
         shares = pos['shares']
 

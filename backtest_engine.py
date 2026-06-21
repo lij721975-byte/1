@@ -1409,6 +1409,14 @@ class BacktestEngine:
         if shares < A_SHARE_LOT_SIZE:
             return
 
+        # Volume constraint: max 5% of today's total volume (anti-infinite-liquidity)
+        day_volume = int(bar.get('volume', 0))
+        max_fill = int(day_volume * 0.05)
+        if max_fill > 0 and shares > max_fill:
+            shares = (max_fill // A_SHARE_LOT_SIZE) * A_SHARE_LOT_SIZE
+        if shares < A_SHARE_LOT_SIZE:
+            return
+
         # Stop loss and targets
         ensemble = signal.get('ensemble', {})
         local_plan = signal.get('local_plan', {})

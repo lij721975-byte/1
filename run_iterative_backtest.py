@@ -253,20 +253,32 @@ class IterativeBacktestRunner:
             'profit_factor': stats.get('profit_factor', 0),
             'annualized_return_pct': stats.get('annualized_return_pct', 0),
             'elapsed_min': elapsed / 60.0,
+            '_trades': trades,
         }
 
     def run(self) -> List[Dict[str, Any]]:
-        """Run the full iterative loop."""
+        """Run walk-forward evolution (replaces old in-sample iterative loop).
+
+        Architecture:
+          For each window [T-window, T]:
+            1. Backtest on training window → collect trades
+            2. Feed trades to SchoolWeightLearner → update weights
+            3. Lock learned weights
+            4. Backtest on test window [T, T+step] WITH LOCKED WEIGHTS → OOS trades
+            5. Slide window forward by step
+            6. Concatenate all OOS trades → final pure out-of-sample statistics
+        """
+        window_days = 180
+        step_days = 30
+
         print()
         print("=" * 70)
-        print("  SELF-ITERATIVE BACKTEST WITH SKILL WEIGHT EVOLUTION")
+        print("  WALK-FORWARD BACKTEST WITH SKILL WEIGHT EVOLUTION")
         print("=" * 70)
         print(f"  Stocks: {len(self.stock_pool)}  |  "
               f"Period: {self.start_date} -> {self.end_date}")
-        print(f"  Confidence threshold: {self.confidence_threshold}  |  "
-              f"Max iterations: {self.max_iterations}")
-        print(f"  Convergence tolerance: {self.convergence_tol} (Sharpe delta)")
-        print(f"  Clear before start: {self.clear_learned_before_start}")
+        print(f"  Train window: {window_days}d  |  Test step: {step_days}d")
+        print(f"  Confidence: {self.confidence_threshold}")
         print("=" * 70)
 
         init_db()
@@ -274,60 +286,148 @@ class IterativeBacktestRunner:
         if self.clear_learned_before_start:
             self._clear_learned_weights()
 
-        prev_sharpe: Optional[float] = None
-        converged = False
+        current = self.start_date
+        all_oos_trades = []
+        window_results = []
+        window_idx = 0
 
-        for iteration in range(1, self.max_iterations + 1):
+        while current + timedelta(days=window_days + step_days) <= self.end_date:
+            train_end = current + timedelta(days=window_days)
+            test_start = train_end + timedelta(days=1)
+            test_end = min(test_start + timedelta(days=step_days - 1), self.end_date)
+            window_idx += 1
+
             print(f"\n{'#' * 70}")
-            print(f"# ITERATION {iteration}/{self.max_iterations}")
+            print(f"# WINDOW {window_idx}: Train [{current} -> {train_end}]  "
+                  f"Test [{test_start} -> {test_end}]")
             print(f"{'#' * 70}")
 
-            result = self._run_iteration(iteration, verbose=(iteration == 1))
-            self.iteration_results.append(result)
+            # ── Phase A: Backtest on training window ──
+            train_runner = IterativeBacktestRunner(
+                stock_pool=self.stock_pool,
+                start_date=current,
+                end_date=train_end,
+                initial_capital=self.initial_capital,
+                position_pct=self.position_pct,
+                stop_pct=self.stop_pct,
+                target_pct=self.target_pct,
+                max_positions=self.max_positions,
+                confidence_threshold=self.confidence_threshold,
+                max_iterations=1,
+                clear_learned_before_start=False,
+                workers=self.workers,
+            )
+            # Use the raw single-iteration backtest (NOT the recursive run())
+            train_result = train_runner._run_iteration(1, verbose=False)
+            train_trades = train_result.get('_trades', [])
 
-            sharpe = result['sharpe_ratio']
-            n_trades = result['total_trades']
+            # ── Phase B: Learn weights from training window ──
+            if train_trades:
+                self.learner.update_from_backtest(train_trades)
+                tuned = self.learner.auto_tune_regime_weights()
+                from trade_logger import save_regime_weights_learned
+                save_regime_weights_learned(tuned)
+                print(f"  Train: {len(train_trades)} trades "
+                      f"Sharpe={train_result.get('sharpe_ratio', 0):.3f} "
+                      f"→ weights updated")
+            else:
+                print(f"  Train: 0 trades → weights unchanged")
 
-            print(f"\n  Iter {iteration} | Sharpe={sharpe:.3f}  "
-                  f"Return={result['total_return_pct']:+.2f}%  "
-                  f"MaxDD={result['max_drawdown_pct']:.2f}%  "
-                  f"Trades={n_trades}  Win={result['win_rate_pct']:.1f}%  "
-                  f"Time={result['elapsed_min']:.1f}m")
+            # ── Phase C: Backtest on test window WITH LOCKED WEIGHTS ──
+            # Snapshot current weights — they are locked for this OOS window
+            test_runner = IterativeBacktestRunner(
+                stock_pool=self.stock_pool,
+                start_date=test_start,
+                end_date=test_end,
+                initial_capital=self.initial_capital,
+                position_pct=self.position_pct,
+                stop_pct=self.stop_pct,
+                target_pct=self.target_pct,
+                max_positions=self.max_positions,
+                confidence_threshold=self.confidence_threshold,
+                max_iterations=1,
+                clear_learned_before_start=False,
+                workers=self.workers,
+            )
+            test_result = test_runner._run_iteration(1, verbose=False)
+            test_trades = test_result.get('_trades', [])
+            if test_trades:
+                all_oos_trades.extend(test_trades)
 
-            # Show current weight state
-            print(f"  Learner: {self.learner._total_trades_attributed} total "
-                  f"trades attributed (α={min(0.60, self.learner._total_trades_attributed / 200.0):.3f})")
+            test_sharpe = test_result.get('sharpe_ratio', 0)
+            print(f"  Test:  {len(test_trades)} trades "
+                  f"Sharpe={test_sharpe:.3f} "
+                  f"Return={test_result.get('total_return_pct', 0):+.2f}% ")
 
-            if iteration > 1 and prev_sharpe is not None:
-                prev_result = self.iteration_results[-2]
-                prev_trades = prev_result.get('total_trades', 0)
-                trade_change = abs(n_trades - prev_trades) / max(prev_trades, 1)
+            # ── Log window result ──
+            window_results.append({
+                'window': window_idx,
+                'train_start': str(current),
+                'train_end': str(train_end),
+                'test_start': str(test_start),
+                'test_end': str(test_end),
+                'train_trades': len(train_trades),
+                'train_sharpe': train_result.get('sharpe_ratio', 0),
+                'test_trades': len(test_trades),
+                'test_sharpe': test_sharpe,
+                'test_return': test_result.get('total_return_pct', 0),
+            })
 
-                delta = abs(sharpe - prev_sharpe)
-                result['sharpe_delta'] = delta
-                print(f"  ΔSharpe={delta:.4f}  ΔTrades={trade_change:.0%}")
+            # ── Slide forward ──
+            current += timedelta(days=step_days)
 
-                # Converge only when ALL conditions met:
-                # 1. Sharpe delta < tolerance
-                # 2. Trade count stable (< 20% change)
-                # 3. At least 2 iterations completed
-                if (delta < self.convergence_tol and
-                    trade_change < 0.20 and
-                    iteration >= 3):
-                    print(f"  >>> CONVERGED (Sharpe stable, trades stable)")
-                    converged = True
-                    break
-                elif delta < self.convergence_tol and trade_change >= 0.20:
-                    print(f"  >>> CONTINUING: Sharpe stable but trades still changing ({trade_change:.0%})")
+        # ── Final: aggregate pure OOS statistics ──
+        print("\n" + "=" * 90)
+        print("  WALK-FORWARD OUT-OF-SAMPLE RESULTS")
+        print("=" * 90)
 
-            prev_sharpe = sharpe
+        if not all_oos_trades:
+            print("  No OOS trades generated.")
+            return window_results
 
-            if n_trades == 0:
-                print("  >>> ABORT: 0 trades — check confidence threshold or data")
-                break
+        all_oos_trades.sort(key=lambda t: t.get('entry_date', ''))
+        n_total = len(all_oos_trades)
+        pnl_pcts = [t.get('net_pnl_pct', 0) for t in all_oos_trades]
+        winners = [p for p in pnl_pcts if p > 0]
+        losers = [p for p in pnl_pcts if p < 0]
 
-        self._print_final_summary()
-        return self.iteration_results
+        import numpy as np
+        final_stats = {
+            'total_windows': window_idx,
+            'total_oos_trades': n_total,
+            'total_return_pct': round(sum(pnl_pcts), 2),
+            'win_rate_pct': round(len(winners) / max(n_total, 1) * 100, 1),
+            'profit_factor': round(abs(sum(winners) / (sum(losers) + 1e-10)), 2),
+            'avg_return_per_trade': round(np.mean(pnl_pcts), 4) if pnl_pcts else 0.0,
+        }
+        if len(pnl_pcts) > 1:
+            final_stats['sharpe_ratio'] = round(
+                float(np.mean(pnl_pcts) / (np.std(pnl_pcts) + 1e-10)), 3)
+        else:
+            final_stats['sharpe_ratio'] = 0.0
+
+        print(f"  Windows completed: {window_idx}")
+        print(f"  Total OOS trades:  {n_total}")
+        print(f"  OOS Sharpe:        {final_stats['sharpe_ratio']:.3f}")
+        print(f"  OOS Return:        {final_stats['total_return_pct']:+.2f}%")
+        print(f"  OOS Win Rate:      {final_stats['win_rate_pct']:.1f}%")
+        print(f"  OOS Profit Factor: {final_stats['profit_factor']:.2f}")
+        print(f"  OOS Avg PnL/trade: {final_stats['avg_return_per_trade']:.4f}%")
+        print("=" * 90)
+
+        # Per-window table
+        print(f"\n  {'Win':<5} {'Train':<24} {'Test':<24} {'TrTrades':>9} {'TeTrades':>9} {'TeSharpe':>9}")
+        print("-" * 95)
+        for w in window_results:
+            print(f"  {w['window']:<5} "
+                  f"{w['train_start']}→{w['train_end']:<10}  "
+                  f"{w['test_start']}→{w['test_end']:<10}  "
+                  f"{w['train_trades']:>9} {w['test_trades']:>9} "
+                  f"{w['test_sharpe']:>9.3f}")
+        print("-" * 95)
+
+        self.iteration_results = window_results
+        return window_results
 
     def _print_final_summary(self) -> None:
         """Print iteration-by-iteration comparison table."""

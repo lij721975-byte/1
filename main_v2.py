@@ -42,6 +42,9 @@ def _prepare_one(symbol):
     if indicators is None:
         return None, symbol, name
 
+    # Inject full daily DataFrame for schools that need time-series context
+    indicators['_df'] = daily
+
     # Compute ensemble ONCE, share between local_plan and tf_coordination
     from expert_ensemble import compute_expert_ensemble
     daily_ensemble = compute_expert_ensemble(indicators)

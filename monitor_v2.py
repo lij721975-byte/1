@@ -91,6 +91,10 @@ def _prepare_one(symbol):
     indicators = compute_all_indicators_v2(daily, hourly, weekly, symbol=symbol)
     if indicators is None:
         return None, symbol, name
+
+    # Inject full daily DataFrame for schools that need time-series context
+    indicators['_df'] = daily
+
     local_plan = extract_local_trade_plan(indicators, daily_df=daily)
     tf_coord = compute_timeframe_coordination(
         indicators,

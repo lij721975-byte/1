@@ -2769,153 +2769,114 @@ def _compute_school_pattern_features(indicators: Dict) -> Dict:
 
 # Map school IDs to compute functions
 def _compute_school_mean_reversion(indicators: Dict) -> Dict:
-    """均值回归学派：BB+RSI+BIAS+KC 多因子 → 连续信号"""
+    """均值回归学派：BB+RSI+BIAS+KC 多因子 → 连续信号 (实盘全量DataFrame)"""
     try:
         from mean_reversion_school import compute_mean_reversion_signal
-        cp = _safe(indicators.get('current_price'), 0)
-        o = _safe(indicators.get('open'), cp)
-        h = _safe(indicators.get('high'), cp)
-        l = _safe(indicators.get('low'), cp)
-        v = _safe(indicators.get('volume'), 0)
-        import pandas as pd
-        df = pd.DataFrame({
-            'open': [o], 'high': [h], 'low': [l], 'close': [cp], 'volume': [v]
-        })
-        # Need enough bars — indicators dict should have rolling data
-        # Fallback: use indicator-derived values for quick check
-        rsi_raw = _safe(indicators.get('rsi'), 50)
-        ma20_raw = _safe(indicators.get('ma20'), cp)
-        bias_raw = (cp - ma20_raw) / (ma20_raw + 1e-10)
-        adx_raw = _safe(indicators.get('dmi_adx'), 20)
-        vol_ratio = _safe(indicators.get('vol_ratio'), 1.0)
-
-        # Simplified 7-condition check from indicators dict
-        score = 0.0; reasons = []
-        # A: Below BB lower (proxy: close relative to MA20-std range)
-        if cp < ma20_raw * 0.92: score += 0.14; reasons.append('超卖:价格远低于MA20')
-        # B: RSI oversold
-        if rsi_raw < 35: score += 0.14; reasons.append(f'RSI={rsi_raw:.0f}<35超卖')
-        elif rsi_raw < 40: score += 0.07
-        # C: BIAS
-        if bias_raw < -0.05: score += 0.14; reasons.append(f'BIAS={bias_raw:.1%}乖离')
-        elif bias_raw < -0.03: score += 0.07
-        # D: Bullish candle (from open/close)
-        if cp > o: score += 0.14; reasons.append('阳线确认')
-        # E: Non-trending
-        if adx_raw < 22: score += 0.14
-        else: reasons.append(f'ADX={adx_raw:.0f}>22趋势禁用')
-        # F: Volume
-        if vol_ratio > 0.6: score += 0.10
-        # G: Not crash
-        if cp > ma20_raw * 0.80: score += 0.10
-        else: reasons.append('崩盘区禁抄底')
-
-        score = _clip_sym(score)
-        return {
-            'direction': _direction_from_score(score, 0.06),
-            'score': round(score, 3),
-            'confidence': round(min(abs(score) * 1.5, 0.92), 3),
-            'reasons': reasons[:5],
-        }
+        df = indicators.get('_df')
+        if df is None or len(df) < 20:
+            return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0,
+                    'reasons': ['实盘全量数据不足']}
+        result = compute_mean_reversion_signal(df)
+        if result:
+            return {'direction': result['signal'],
+                    'score': result['metadata'].get('score', 0),
+                    'confidence': result['confidence'],
+                    'reasons': result['metadata'].get('reasons', [])}
     except Exception:
-        return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0, 'reasons': []}
+        pass
+    return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0, 'reasons': []}
 
 
 def _compute_school_nd(indicators: Dict) -> Dict:
-    """正态分布学派：Z-Score超卖企稳/动量突破 → 连续信号"""
+    """正态分布学派：Z-Score超卖企稳/动量突破 → 连续信号 (实盘全量DataFrame)"""
     try:
         from normal_distribution_school import compute_nd_signal
-        cp = _safe(indicators.get('current_price'), 0)
-        o = _safe(indicators.get('open'), cp)
-        h = _safe(indicators.get('high'), cp)
-        l = _safe(indicators.get('low'), cp)
-        v = _safe(indicators.get('volume'), 0)
-        import pandas as pd
-        df = pd.DataFrame({'open': [o], 'high': [h], 'low': [l], 'close': [cp], 'volume': [v]})
+        df = indicators.get('_df')
+        if df is None or len(df) < 20:
+            return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0,
+                    'reasons': ['实盘全量数据不足']}
         result = compute_nd_signal(df)
         if result:
-            return {'direction': result['signal'], 'score': result['metadata'].get('score', 0),
-                    'confidence': result['confidence'], 'reasons': result['metadata'].get('reasons', [])}
+            return {'direction': result['signal'],
+                    'score': result['metadata'].get('score', 0),
+                    'confidence': result['confidence'],
+                    'reasons': result['metadata'].get('reasons', [])}
     except Exception:
         pass
     return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0, 'reasons': []}
 
 
 def _compute_school_vp(indicators: Dict) -> Dict:
-    """成交量分布学派：POC突破/回踩/受阻 → 连续信号"""
+    """成交量分布学派：POC突破/回踩/受阻 → 连续信号 (实盘全量DataFrame)"""
     try:
         from volume_profile_school import compute_vp_signal
-        cp = _safe(indicators.get('current_price'), 0)
-        o = _safe(indicators.get('open'), cp)
-        h = _safe(indicators.get('high'), cp)
-        l = _safe(indicators.get('low'), cp)
-        v = _safe(indicators.get('volume'), 0)
-        import pandas as pd
-        df = pd.DataFrame({'open': [o], 'high': [h], 'low': [l], 'close': [cp], 'volume': [v]})
+        df = indicators.get('_df')
+        if df is None or len(df) < 20:
+            return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0,
+                    'reasons': ['实盘全量数据不足']}
         result = compute_vp_signal(df)
         if result:
-            return {'direction': result['signal'], 'score': result['metadata'].get('score', 0),
-                    'confidence': result['confidence'], 'reasons': result['metadata'].get('reasons', [])}
+            return {'direction': result['signal'],
+                    'score': result['metadata'].get('score', 0),
+                    'confidence': result['confidence'],
+                    'reasons': result['metadata'].get('reasons', [])}
     except Exception:
         pass
     return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0, 'reasons': []}
 
 
 def _compute_school_ewm_beta(indicators: Dict) -> Dict:
-    """EWM Beta学派：指数衰减加权β → 连续信号"""
+    """EWM Beta学派：指数衰减加权β → 连续信号 (实盘全量DataFrame)"""
     try:
         from ewm_beta_factor import compute_ewm_beta_signal
-        cp = _safe(indicators.get('current_price'), 0)
-        o = _safe(indicators.get('open'), cp)
-        h = _safe(indicators.get('high'), cp)
-        l = _safe(indicators.get('low'), cp)
-        v = _safe(indicators.get('volume'), 0)
-        import pandas as pd
-        df = pd.DataFrame({'open': [o], 'high': [h], 'low': [l], 'close': [cp], 'volume': [v]})
+        df = indicators.get('_df')
+        if df is None or len(df) < 20:
+            return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0,
+                    'reasons': ['实盘全量数据不足']}
         result = compute_ewm_beta_signal(df)
         if result:
-            return {'direction': result['signal'], 'score': result['metadata'].get('score', 0),
-                    'confidence': result['confidence'], 'reasons': result['metadata'].get('reasons', [])}
+            return {'direction': result['signal'],
+                    'score': result['metadata'].get('score', 0),
+                    'confidence': result['confidence'],
+                    'reasons': result['metadata'].get('reasons', [])}
     except Exception:
         pass
     return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0, 'reasons': []}
 
 
 def _compute_school_beta(indicators: Dict) -> Dict:
-    """历史Beta学派：高Beta牛/熊市判定 → 连续信号"""
+    """历史Beta学派：高Beta牛/熊市判定 → 连续信号 (实盘全量DataFrame)"""
     try:
         from beta_factor import compute_beta_signal
-        cp = _safe(indicators.get('current_price'), 0)
-        o = _safe(indicators.get('open'), cp)
-        h = _safe(indicators.get('high'), cp)
-        l = _safe(indicators.get('low'), cp)
-        v = _safe(indicators.get('volume'), 0)
-        import pandas as pd
-        df = pd.DataFrame({'open': [o], 'high': [h], 'low': [l], 'close': [cp], 'volume': [v]})
+        df = indicators.get('_df')
+        if df is None or len(df) < 20:
+            return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0,
+                    'reasons': ['实盘全量数据不足']}
         result = compute_beta_signal(df)
         if result:
-            return {'direction': result['signal'], 'score': result['metadata'].get('score', 0),
-                    'confidence': result['confidence'], 'reasons': result['metadata'].get('reasons', [])}
+            return {'direction': result['signal'],
+                    'score': result['metadata'].get('score', 0),
+                    'confidence': result['confidence'],
+                    'reasons': result['metadata'].get('reasons', [])}
     except Exception:
         pass
     return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0, 'reasons': []}
 
 
 def _compute_school_roc_factor(indicators: Dict) -> Dict:
-    """ROC动量因子学派：AX/BX ROC变体 → 连续信号"""
+    """ROC动量因子学派：AX/BX ROC变体 → 连续信号 (实盘全量DataFrame)"""
     try:
         from roc_factor import compute_roc_signal
-        cp = _safe(indicators.get('current_price'), 0)
-        o = _safe(indicators.get('open'), cp)
-        h = _safe(indicators.get('high'), cp)
-        l = _safe(indicators.get('low'), cp)
-        v = _safe(indicators.get('volume'), 0)
-        import pandas as pd
-        df = pd.DataFrame({'open': [o], 'high': [h], 'low': [l], 'close': [cp], 'volume': [v]})
+        df = indicators.get('_df')
+        if df is None or len(df) < 20:
+            return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0,
+                    'reasons': ['实盘全量数据不足']}
         result = compute_roc_signal(df)
         if result:
-            return {'direction': result['signal'], 'score': result['metadata'].get('score', 0),
-                    'confidence': result['confidence'], 'reasons': result['metadata'].get('reasons', [])}
+            return {'direction': result['signal'],
+                    'score': result['metadata'].get('score', 0),
+                    'confidence': result['confidence'],
+                    'reasons': result['metadata'].get('reasons', [])}
     except Exception:
         pass
     return {'direction': 'neutral', 'score': 0.0, 'confidence': 0.0, 'reasons': []}
